@@ -798,8 +798,10 @@ function TopForPosition({
         const exclude = Array.from(draftedIds).join(',')
         const res = await fetch(`/api/projections?pos=${pos}&limit=${limit}&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}`, { cache: 'no-store' })
         if (!res.ok) throw new Error(`projections failed ${res.status}`)
-        const json = await res.json() as { players: ProjectionRow[] }
-        if (!ignore) setRows(json.players || [])
+        const json = (await res.json()) as { players: ProjectionRow[] }
+        const norm = (s?: string) => String(s || '').toUpperCase().trim()
+        const filtered = (json.players || []).filter(p => norm(p.position) === pos)
+        if (!ignore) setRows(filtered)
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
