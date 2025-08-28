@@ -289,6 +289,7 @@ function PlayerSearch({
 /* ============================ Roster Builder ============================== */
 
 type SlotDef = { key: string; label: string; types: ('QB'|'RB'|'WR'|'TE')[] }
+
 const DEFAULT_SLOTS: SlotDef[] = [
   { key: 'QB1',  label: 'QB',   types: ['QB'] },
   { key: 'RB1',  label: 'RB1',  types: ['RB'] },
@@ -297,8 +298,14 @@ const DEFAULT_SLOTS: SlotDef[] = [
   { key: 'WR2',  label: 'WR2',  types: ['WR'] },
   { key: 'WR3',  label: 'WR3',  types: ['WR'] },
   { key: 'TE1',  label: 'TE',   types: ['TE'] },
-  { key: 'FX1',  label: 'FLEX1',types: ['RB','WR','TE'] },
-  { key: 'FX2',  label: 'FLEX2',types: ['RB','WR','TE'] },
+
+  
+  { key: 'BN1',  label: 'Bench 1', types: ['QB','RB','WR','TE'] },
+  { key: 'BN2',  label: 'Bench 2', types: ['QB','RB','WR','TE'] },
+  { key: 'BN3',  label: 'Bench 3', types: ['QB','RB','WR','TE'] },
+  { key: 'BN4',  label: 'Bench 4', types: ['QB','RB','WR','TE'] },
+  { key: 'BN5',  label: 'Bench 5', types: ['QB','RB','WR','TE'] },
+  { key: 'BN6',  label: 'Bench 6', types: ['QB','RB','WR','TE'] },
 ]
 
 function RosterSlot({
@@ -407,7 +414,7 @@ function RosterBuilder({
         </div>
         <Separator className="bg-white/20" />
         <div className="flex items-center justify-between flex-wrap gap-3">
-          <div className="text-sm opacity-85">FLEX accepts RB / WR / TE.</div>
+          <div className="text-sm opacity-85">Bench accepts any position (QB / RB / WR / TE)</div>
           {projectedTotalPoints}
         </div>
       </CardContent>
