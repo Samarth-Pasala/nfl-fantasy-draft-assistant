@@ -802,10 +802,10 @@ function TopForPosition({
         const norm = (s?: string) => String(s || '').toUpperCase().trim()
         const rowsFromApi = Array.isArray(json.players) ? json.players : []
         
-        // Try to filter by position if the row has one.
-        // If filtering removes everything (or rows lack `position`), fall back to the raw list.
-        const filtered = rowsFromApi.filter(r => r.position && norm(r.position) === pos)
-        if (!ignore) setRows(filtered.length ? filtered : rowsFromApi)
+        const hasAnyPosition = rowsFromApi.some(r => r.position != null && String(r.position).trim() !== '')
+        const filtered = rowsFromApi.filter(r => norm(r.position) === pos)
+        
+        if (!ignore) setRows(hasAnyPosition ? filtered : rowsFromApi)
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
