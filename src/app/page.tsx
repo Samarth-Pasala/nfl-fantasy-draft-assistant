@@ -758,14 +758,63 @@ function BestAvailable({
   preset: ScoringPreset
   passTd: 4 | 6
 }) {
+  const [rows, setRows] = React.useState<ProjectionRow[] | null>(null)
+  const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    let ignore = false
+
+    async function run() {
+      setLoading(true); setError(null); setRows(null)
+      try {
+        const exclude = Array.from(draftedIds).join(',')
+        const res = await fetch(
+          `/api/projections?pos=ALL&limit=15&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}&fast=1`,
+          { cache: 'no-store' }
+        )
+        if (!res.ok) throw new Error(`projections failed ${res.status}`)
+        const json = (await res.json()) as { players: ProjectionRow[] }
+        if (!ignore) setRows(json.players || [])
+      } catch (e: any) {
+        if (!ignore) setError(e?.message || 'Failed to load')
+      } finally {
+        if (!ignore) setLoading(false)
+      }
+    }
+
+    run()
+    return () => { ignore = true }
+  }, [draftedIds, preset, passTd])
+
   return (
     <Card className="bg-white/10 border-white/20 text-white">
       <CardContent className="p-4 space-y-6">
-        <div className="text-lg font-semibold">Best Available (Top 15 overall)</div>
-        <div className="text-xs opacity-70">
-          First load may take a bit while projections build. Afterwards, it’s instant (cached).
-        </div>
-        <TopOverall draftedIds={draftedIds} preset={preset} passTd={passTd} limit={15} />
+        <div className="text-lg font-semibold">Best Available (Top 15 Overall)</div>
+
+        {loading && <div className="text-sm opacity-75">Loading…</div>}
+        {error && !loading && <div className="text-sm text-red-300">{error}</div>}
+        {!loading && !error && (!rows || rows.length === 0) && (
+          <div className="text-sm opacity-75">No eligible players found.</div>
+        )}
+
+        {!!rows && rows.length > 0 && (
+          <div className="space-y-2">
+            {rows.map((r) => (
+              <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold truncate">{r.full_name}</div>
+                  <div className="text-xs opacity-80 truncate">
+                    {r.position}{r.team ? ` • ${r.team}` : ''}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-base font-semibold">{r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   )
@@ -814,12 +863,10 @@ function TopOverall({
           okResponses.map(r => r.json() as Promise<{ players: ProjectionRow[] }>)
         )
 
-        // merge everything — NO position filtering at all
         const merged: ProjectionRow[] = payloads.flatMap(p =>
           Array.isArray(p.players) ? p.players : []
         )
 
-        // de-dupe + remove drafted
         const seen = new Set<string>()
         const dedup: ProjectionRow[] = []
         for (const r of merged) {
