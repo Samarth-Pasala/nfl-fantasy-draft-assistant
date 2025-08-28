@@ -758,32 +758,29 @@ function BestAvailable({
   preset: ScoringPreset
   passTd: 4 | 6
 }) {
-  const limits = { QB: 5, TE: 5, RB: 10, WR: 10 } as const
-
   return (
     <Card className="bg-white/10 border-white/20 text-white">
       <CardContent className="p-4 space-y-6">
-        <div className="text-lg font-semibold">Best Available</div>
-        <div className="text-xs opacity-70">First load may take a bit while projections build. Afterwards, it’s instant (cached).</div>
-
-        <TopForPosition pos="QB" title="Quarterbacks" limit={limits.QB} draftedIds={draftedIds} preset={preset} passTd={passTd} />
-        <TopForPosition pos="RB" title="Running Backs" limit={limits.RB} draftedIds={draftedIds} preset={preset} passTd={passTd} />
-        <TopForPosition pos="WR" title="Wide Receivers" limit={limits.WR} draftedIds={draftedIds} preset={preset} passTd={passTd} />
-        <TopForPosition pos="TE" title="Tight Ends" limit={limits.TE} draftedIds={draftedIds} preset={preset} passTd={passTd} />
+        <div className="text-lg font-semibold">Best Available (Top 15 overall)</div>
+        <div className="text-xs opacity-70">
+          First load may take a bit while projections build. Afterwards, it’s instant (cached).
+        </div>
+        <TopOverall draftedIds={draftedIds} preset={preset} passTd={passTd} limit={15} />
       </CardContent>
     </Card>
   )
 }
 
-function TopForPosition({
-  pos, title, limit, draftedIds, preset, passTd,
+function TopOverall({
+  draftedIds,
+  preset,
+  passTd,
+  limit = 15,
 }: {
-  pos: 'QB' | 'RB' | 'WR' | 'TE'
-  title: string
-  limit: number
   draftedIds: Set<string>
   preset: ScoringPreset
   passTd: 4 | 6
+  limit?: number
 }) {
   const [rows, setRows] = React.useState<ProjectionRow[] | null>(null)
   const [loading, setLoading] = React.useState(true)
@@ -791,37 +788,47 @@ function TopForPosition({
 
   React.useEffect(() => {
     let ignore = false
-
     async function run() {
       setLoading(true); setError(null); setRows(null)
       try {
-        const exclude = Array.from(draftedIds).join(',')
-        const res = await fetch(`/api/projections?pos=${pos}&limit=${limit}&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}`, { cache: 'no-store' })
-        if (!res.ok) throw new Error(`projections failed ${res.status}`)
-        const json = (await res.json()) as { players: ProjectionRow[] }
-        const norm = (s?: string) => String(s || '').toUpperCase().trim()
-        const rowsFromApi = Array.isArray(json.players) ? json.players : []
-        
-        const hasAnyPosition = rowsFromApi.some(r => r.position != null && String(r.position).trim() !== '')
-        const filtered = rowsFromApi.filter(r => norm(r.position) === pos)
-        
-        if (!ignore) setRows(hasAnyPosition ? filtered : rowsFromApi)
+        // Pull plenty from each position, then merge.
+        const posList: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
+        const qs = (pos: string) =>
+          `/api/projections?pos=${pos}&limit=${limit * 4}&preset=${preset}&passTd=${passTd}`
+
+        const resps = await Promise.all(posList.map(p => fetch(qs(p), { cache: 'no-store' })))
+        const bad = resps.find(r => !r.ok)
+        if (bad) throw new Error(`projections failed ${bad.status}`)
+
+        const payloads = await Promise.all(resps.map(r => r.json() as Promise<{ players: ProjectionRow[] }>))
+        const merged = payloads.flatMap(p => Array.isArray(p.players) ? p.players : [])
+
+        // De-dupe (player can appear in multiple lists) and remove drafted.
+        const seen = new Set<string>()
+        const dedup: ProjectionRow[] = []
+        for (const r of merged) {
+          if (!r?.player_id || draftedIds.has(r.player_id)) continue
+          if (seen.has(r.player_id)) continue
+          seen.add(r.player_id)
+          dedup.push(r)
+        }
+
+        // Sort and cap
+        const top = dedup.sort((a, b) => (b.ppg || 0) - (a.ppg || 0)).slice(0, limit)
+        if (!ignore) setRows(top)
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
         if (!ignore) setLoading(false)
       }
     }
-
     run()
     return () => { ignore = true }
-  }, [pos, limit, draftedIds, preset, passTd])
+  }, [draftedIds, preset, passTd, limit])
 
   return (
     <div className="space-y-3">
-      <div className="text-sm font-semibold uppercase tracking-wide opacity-90">{title}</div>
-
-      {loading && <div className="text-sm opacity-75">Loading best available {title.toLowerCase()}…</div>}
+      {loading && <div className="text-sm opacity-75">Loading best available…</div>}
       {error && !loading && <div className="text-sm text-red-300">{error}</div>}
       {!loading && !error && (!rows || rows.length === 0) && (
         <div className="text-sm opacity-75">No eligible players found.</div>
@@ -830,7 +837,10 @@ function TopForPosition({
       {!!rows && rows.length > 0 && (
         <div className="space-y-2">
           {rows.map((r) => (
-            <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
+            <div
+              key={r.player_id}
+              className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3"
+            >
               <div className="min-w-0">
                 <div className="text-sm font-semibold truncate">{r.full_name}</div>
                 <div className="text-xs opacity-80 truncate">
@@ -838,7 +848,9 @@ function TopForPosition({
                 </div>
               </div>
               <div className="text-right">
-                <div className="text-base font-semibold">{r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span></div>
+                <div className="text-base font-semibold">
+                  {r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span>
+                </div>
               </div>
             </div>
           ))}
