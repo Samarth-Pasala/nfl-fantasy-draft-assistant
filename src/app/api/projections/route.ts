@@ -1,10 +1,12 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export const runtime = 'nodejs'
 
+type ScoringPreset = 'PPR' | 'HALF_PPR' | 'STANDARD'
+
 type PlayerLite = {
   player_id: string
   full_name: string
-  position: 'QB' | 'RB' | 'WR' | 'TE' | string
+  position: 'QB'|'RB'|'WR'|'TE'|string
   team?: string
   birth_date?: string
 }
@@ -31,125 +33,65 @@ type WeeklyStat = {
 type ProjectionRow = {
   player_id: string
   full_name: string
-  position: 'QB'|'RB'|'WR'|'TE'|string
+  position: string
   team?: string
   ppg: number
 }
 
-const SEASONS = [2020, 2021, 2022, 2023, 2024]
-const LAST_N = 50
-const BUILD_TTL_MS = 1000 * 60 * 60 // 1 hour cache
-const MAX_CONCURRENCY = 10
+// ---------------- helpers reused from your page ----------------
+function weeklyPoints(stat: WeeklyStat, preset: ScoringPreset, passTd: 4 | 6) {
+  if (preset === 'PPR' && stat.pts_ppr != null) return stat.pts_ppr
+  if (preset === 'HALF_PPR' && stat.pts_half_ppr != null) return stat.pts_half_ppr
+  if (preset === 'STANDARD' && stat.pts_std != null) return stat.pts_std
+  const pass = (stat.pass_yd ?? 0) * 0.04 + (stat.pass_td ?? 0) * passTd + (stat.pass_int ?? 0) * -1
+  const rush = (stat.rush_yd ?? 0) * 0.1 + (stat.rush_td ?? 0) * 6
+  const catchBonus = preset === 'PPR' ? 1 : preset === 'HALF_PPR' ? 0.5 : 0
+  const rec = (stat.rec_yd ?? 0) * 0.1 + (stat.rec_td ?? 0) * 6 + (stat.rec ?? 0) * catchBonus
+  return pass + rush + rec
+}
 
-/* ---------------- shared tiny utils ---------------- */
 function yearsSince(dateISO?: string) {
   if (!dateISO) return undefined
-  const d = new Date(dateISO); if (Number.isNaN(d.getTime())) return undefined
+  const d = new Date(dateISO)
+  if (Number.isNaN(d.getTime())) return undefined
   const now = new Date()
   return (now.getTime() - d.getTime()) / (365.25 * 24 * 3600 * 1000)
 }
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n))
-}
+
 function ageMultiplier(pos: string, age?: number) {
   if (!age) return 1
   let mult = 1
   if (pos === 'RB') {
     const d = age - 26
-    if (d > 0) mult *= 1 - clamp(0.06 * d, 0, 0.25)
-    if (d < 0) mult *= 1 + clamp(0.02 * -d, 0, 0.08)
+    if (d > 0) mult *= 1 - Math.min(0.25, 0.06 * d)
+    if (d < 0) mult *= 1 + Math.min(0.08, 0.02 * -d)
   } else if (pos === 'WR') {
     const d = age - 27
-    if (d > 0) mult *= 1 - clamp(0.03 * d, 0, 0.18)
-    if (d < 0) mult *= 1 + clamp(0.015 * -d, 0, 0.06)
+    if (d > 0) mult *= 1 - Math.min(0.18, 0.03 * d)
+    if (d < 0) mult *= 1 + Math.min(0.06, 0.015 * -d)
   } else if (pos === 'TE') {
     const d = age - 28
-    if (d > 0) mult *= 1 - clamp(0.02 * d, 0, 0.12)
-    if (d < 0) mult *= 1 + clamp(0.01 * -d, 0, 0.05)
+    if (d > 0) mult *= 1 - Math.min(0.12, 0.02 * d)
+    if (d < 0) mult *= 1 + Math.min(0.05, 0.01 * -d)
   } else if (pos === 'QB') {
     const d = age - 32
-    if (d > 0) mult *= 1 - clamp(0.015 * d, 0, 0.12)
-    if (d < 0) mult *= 1 + clamp(0.01 * -d, 0, 0.05)
+    if (d > 0) mult *= 1 - Math.min(0.12, 0.015 * d)
+    if (d < 0) mult *= 1 + Math.min(0.05, 0.01 * -d)
   }
   return mult
 }
-function pickNum(row: Record<string, any>, keys: string[]): number | undefined {
-  for (const k of keys) {
-    const v = row[k]
-    if (typeof v === 'number' && Number.isFinite(v)) return v
-    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v)
-  }
-  return undefined
-}
-function weeklyPoints(stat: WeeklyStat, preset: 'PPR'|'HALF_PPR'|'STANDARD', passTd: 4|6) {
-  if (preset === 'PPR' && stat.pts_ppr != null) return stat.pts_ppr!
-  if (preset === 'HALF_PPR' && stat.pts_half_ppr != null) return stat.pts_half_ppr!
-  if (preset === 'STANDARD' && stat.pts_std != null) return stat.pts_std!
-  const passPoints = (stat.pass_yd ?? 0) * 0.04 + (stat.pass_td ?? 0) * passTd + (stat.pass_int ?? 0) * -1
-  const rushPoints = (stat.rush_yd ?? 0) * 0.1 + (stat.rush_td ?? 0) * 6
-  const catchBonus = preset === 'PPR' ? 1 : preset === 'HALF_PPR' ? 0.5 : 0
-  const recPoints = (stat.rec_yd ?? 0) * 0.1 + (stat.rec_td ?? 0) * 6 + (stat.rec ?? 0) * catchBonus
-  return passPoints + rushPoints + recPoints
-}
 
-/* -------------- fetch players + cache -------------- */
-let _playersCache: { at: number; players: PlayerLite[] } | null = null
-async function loadPlayers(): Promise<PlayerLite[]> {
-  if (_playersCache && Date.now() - _playersCache.at < BUILD_TTL_MS) return _playersCache.players
-  const r = await fetch('https://api.sleeper.app/v1/players/nfl', { cache: 'no-store' })
-  const json = await r.json()
-  const players: PlayerLite[] = Object.values(json).map((p: any) => ({
-    player_id: String(p.player_id ?? p.id ?? ''),
-    full_name: p.full_name || (p.first_name && p.last_name ? `${p.first_name} ${p.last_name}` : p.name ?? ''),
-    position: p.position,
-    team: p.team,
-    birth_date: p.birth_date || p.birthdate || p.birthDate,
-  })).filter(p => p.player_id && p.full_name && ['QB','RB','WR','TE'].includes(p.position))
-  _playersCache = { at: Date.now(), players }
-  return players
-}
-
-/* -------------- week fetch cache (shared) ---------- */
-const weekCache = new Map<string, any[]>()
-const weekCacheTime = new Map<string, number>()
-const WEEK_TTL_MS = 15 * 60 * 1000
-
-async function fetchWeek(season: number, week: number): Promise<any[]> {
-  const key = `${season}:${week}`
-  const now = Date.now()
-  const ts = weekCacheTime.get(key)
-  if (ts && now - ts < WEEK_TTL_MS && weekCache.has(key)) {
-    return weekCache.get(key) as any[]
-  }
-  const urls = [
-    `https://api.sleeper.app/stats/nfl/${season}/${week}?season_type=regular`,
-    `https://api.sleeper.app/v1/stats/nfl/${season}/${week}?season_type=regular`,
-    `https://api.sleeper.app/v1/stats/nfl/regular/${season}/${week}`,
-  ]
-  for (const url of urls) {
-    try {
-      const r = await fetch(url, { cache: 'no-store' })
-      if (r.ok) {
-        const data = await r.json()
-        const arr: any[] = Array.isArray(data) ? data : Array.isArray((data as any)?.stats) ? (data as any).stats : []
-        weekCache.set(key, arr); weekCacheTime.set(key, now)
-        return arr
-      }
-    } catch {}
-  }
-  weekCache.set(key, []); weekCacheTime.set(key, now)
-  return []
-}
-
-/* -------------- compute last-50 PPG ---------------- */
-function lastNPlayedPoints(weeks: WeeklyStat[], n: number, preset: 'PPR'|'HALF_PPR'|'STANDARD', passTd: 4|6) {
-  // weeks may arrive mixed; we only need non-zero fantasy outputs
-  const pts: number[] = []
-  // prefer newest first for “last N”
+function lastNPlayedPoints(
+  weeks: WeeklyStat[],
+  n: number,
+  preset: ScoringPreset,
+  passTd: 4 | 6
+) {
   const sorted = [...weeks].sort((a, b) => (b.season - a.season) || (b.week - a.week))
+  const pts: number[] = []
   for (const w of sorted) {
     const p = weeklyPoints(w, preset, passTd)
-    if (p !== 0) {
+    if (Number.isFinite(p) && p !== 0) {
       pts.push(p)
       if (pts.length >= n) break
     }
@@ -157,143 +99,174 @@ function lastNPlayedPoints(weeks: WeeklyStat[], n: number, preset: 'PPR'|'HALF_P
   return pts
 }
 
-async function fetchLast50ForPlayer(p: PlayerLite, preset: 'PPR'|'HALF_PPR'|'STANDARD', passTd: 4|6): Promise<number> {
-  const id = p.player_id
-  const idNum = Number(id); const hasNum = !Number.isNaN(idNum)
-  const weeks: WeeklyStat[] = []
-  let collected = 0
+function average(arr: number[]) {
+  if (!arr.length) return 0
+  return arr.reduce((a, b) => a + b, 0) / arr.length
+}
 
-  for (const season of [...SEASONS].sort((a,b)=>b-a)) {
-    if (collected >= LAST_N) break
-    for (let wk = 18; wk >= 1; wk--) {
-      const arr = await fetchWeek(season, wk)
-      if (!arr.length) continue
-      const row =
-        arr.find((x: any) => String(x.player_id) === String(id)) ??
-        (hasNum ? arr.find((x: any) => Number(x.player_id) === idNum) : undefined)
-      if (!row) continue
+// ---------------- small fetchers ----------------
+async function fetchPlayers(): Promise<PlayerLite[]> {
+  const r = await fetch('https://api.sleeper.app/v1/players/nfl', { cache: 'no-store' })
+  const json = await r.json()
+  return Object.values(json).map((p: any) => ({
+    player_id: String(p.player_id ?? p.id ?? ''),
+    full_name: p.full_name || (p.first_name && p.last_name ? `${p.first_name} ${p.last_name}` : p.name ?? ''),
+    position: p.position,
+    team: p.team,
+    birth_date: p.birth_date || p.birthdate || p.birthDate,
+  })).filter(p => p.player_id && p.full_name && ['QB','RB','WR','TE'].includes(p.position))
+}
 
-      const s = (row.stats ?? row) as Record<string, any>
-      const stat: WeeklyStat = {
-        week: wk, season, player_id: id,
-        pts_ppr: pickNum(s, ['pts_ppr','ppr_points']),
-        pts_half_ppr: pickNum(s, ['pts_half_ppr','half_ppr_points']),
-        pts_std: pickNum(s, ['pts_std','standard_points']),
-        pass_yd: pickNum(s, ['pass_yd','passing_yards']),
-        pass_td: pickNum(s, ['pass_td','passing_tds']),
-        pass_int: pickNum(s, ['pass_int','interceptions']),
-        rush_yd: pickNum(s, ['rush_yd','rushing_yards']),
-        rush_td: pickNum(s, ['rush_td','rushing_tds']),
-        rec: pickNum(s, ['rec','receptions']),
-        rec_yd: pickNum(s, ['rec_yd','receiving_yards']),
-        rec_td: pickNum(s, ['rec_td','receiving_tds']),
-        targets: pickNum(s, ['targets','tgt','rec_tgt']),
-        carries: pickNum(s, ['carries','rush_att','rushing_att']),
+async function fetchWeek(season: number, week: number): Promise<any[]> {
+  const urls = [
+    `https://api.sleeper.app/stats/nfl/${season}/${week}?season_type=regular`,
+    `https://api.sleeper.app/v1/stats/nfl/${season}/${week}?season_type=regular`,
+    `https://api.sleeper.app/v1/stats/nfl/regular/${season}/${week}`,
+  ]
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { cache: 'no-store' })
+      if (res.ok) {
+        const data = await res.json()
+        return Array.isArray(data) ? data : Array.isArray((data as any)?.stats) ? (data as any).stats : []
       }
-      // if all undefined, skip; else accept
-      if (
-        stat.pts_ppr != null || stat.pts_half_ppr != null || stat.pts_std != null ||
-        stat.pass_yd != null || stat.rush_yd != null || stat.rec_yd != null || stat.rec != null
-      ) {
-        weeks.push(stat)
-        collected++
-        if (collected >= LAST_N) break
-      }
+    } catch {}
+  }
+  return []
+}
+
+// ---------------- in-memory cache (per position) ----------------
+type PosKey = 'QB'|'RB'|'WR'|'TE'
+const POSITIONS: PosKey[] = ['QB','RB','WR','TE']
+const posCache = new Map<
+  string, // key: `${preset}-${passTd}-${pos}`
+  { at: number; rows: ProjectionRow[] }
+>()
+const IDS_CACHE = new Map<
+  string, // key: `${preset}-${passTd}-${id}`
+  { at: number; row?: ProjectionRow }
+>()
+
+const STALE_MS = 12 * 60 * 60 * 1000 // 12 hours
+const SEASONS_DEFAULT = [2022, 2023, 2024] // enough for ~50 games for most
+
+// Build projections for a subset of players (one position OR a few ids)
+async function buildProjectionsFor(
+  players: PlayerLite[],
+  opts: { preset: ScoringPreset; passTd: 4|6; seasons?: number[] }
+): Promise<ProjectionRow[]> {
+  const seasons = opts.seasons ?? SEASONS_DEFAULT
+
+  // 1) pull all weekly stats once per week, then aggregate by player_id
+  const weeks: any[][] = []
+  for (const season of seasons) {
+    for (let wk = 1; wk <= 18; wk++) {
+      // fast-fail if the function is running a long time (Netlify)
+      weeks.push(await fetchWeek(season, wk))
     }
   }
 
-  if (!weeks.length) return 0
-  const pts = lastNPlayedPoints(weeks, LAST_N, preset, passTd)
-  const base = pts.length ? pts.reduce((s,v)=>s+v,0)/pts.length : 0
-  const ageYears = p.birth_date ? Math.floor(yearsSince(p.birth_date) || 0) : undefined
-  return base * ageMultiplier(p.position, ageYears)
-}
-
-/* -------------- cache build ---------------- */
-let _projectionsCache:
-  | { at: number; preset: 'PPR'|'HALF_PPR'|'STANDARD'; passTd: 4|6; rows: ProjectionRow[] }
-  | null = null
-let _building: Promise<void> | null = null
-
-async function ensureProjections(preset: 'PPR'|'HALF_PPR'|'STANDARD', passTd: 4|6) {
-  const fresh = _projectionsCache &&
-    Date.now() - _projectionsCache.at < BUILD_TTL_MS &&
-    _projectionsCache.preset === preset &&
-    _projectionsCache.passTd === passTd
-  if (fresh) return
-
-  if (_building) { await _building; return }
-
-  _building = (async () => {
-    const players = await loadPlayers()
-
-    // Prioritize players with a current team & cap the pool a bit for speed
-    const withTeam = players.filter(p => !!p.team)
-    const withoutTeam = players.filter(p => !p.team)
-    const pool = [...withTeam.slice(0, 1200), ...withoutTeam.slice(0, 400)] // tune caps as needed
-
-    const rows: ProjectionRow[] = []
-    let idx = 0
-
-    async function worker() {
-      while (idx < pool.length) {
-        const p = pool[idx++]
-        try {
-          const ppg = await fetchLast50ForPlayer(p, preset, passTd)
-          if (ppg > 0) {
-            rows.push({
-              player_id: p.player_id,
-              full_name: p.full_name,
-              position: p.position,
-              team: p.team,
-              ppg,
-            })
-          }
-        } catch { /* skip on error */ }
+  const bucket = new Map<string, WeeklyStat[]>()
+  for (const arr of weeks) {
+    for (const row of arr) {
+      const id = String(row.player_id)
+      const stats = (row.stats ?? row) as any
+      const w: WeeklyStat = {
+        week: Number(row.week),
+        season: Number(row.season),
+        player_id: id,
+        pts_ppr: stats.pts_ppr ?? stats.ppr_points,
+        pts_half_ppr: stats.pts_half_ppr,
+        pts_std: stats.pts_std,
+        pass_yd: stats.pass_yd ?? stats.passing_yards,
+        pass_td: stats.pass_td ?? stats.passing_tds,
+        pass_int: stats.pass_int ?? stats.interceptions,
+        rush_yd: stats.rush_yd ?? stats.rushing_yards,
+        rush_td: stats.rush_td ?? stats.rushing_tds,
+        rec: stats.rec ?? stats.receptions,
+        rec_yd: stats.rec_yd ?? stats.receiving_yards,
+        rec_td: stats.rec_td ?? stats.receiving_tds,
+        targets: stats.targets ?? stats.rec_tgt ?? stats.tgt,
+        carries: stats.carries ?? stats.rush_att ?? stats.rushing_att,
       }
+      if (!Number.isFinite(w.week) || !Number.isFinite(w.season)) continue
+      if (!bucket.has(id)) bucket.set(id, [])
+      bucket.get(id)!.push(w)
     }
+  }
 
-    await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => worker()))
+  // 2) compute ppg for each requested player using last 50 played games + age adj
+  const rows: ProjectionRow[] = []
+  for (const p of players) {
+    const arr = bucket.get(p.player_id) ?? []
+    const last50 = lastNPlayedPoints(arr, 50, opts.preset, opts.passTd)
+    const base = average(last50)
+    const age = yearsSince(p.birth_date) ? Math.floor(yearsSince(p.birth_date)!) : undefined
+    const adj = base * ageMultiplier(p.position, age)
+    rows.push({
+      player_id: p.player_id,
+      full_name: p.full_name,
+      position: p.position,
+      team: p.team,
+      ppg: Number.isFinite(adj) ? adj : 0,
+    })
+  }
 
-    _projectionsCache = { at: Date.now(), preset, passTd, rows }
-  })()
-
-  try { await _building } finally { _building = null }
+  return rows
 }
 
-/* -------------- GET handler ---------------- */
 export async function GET(req: Request) {
-    const url = new URL(req.url)
-    const preset = (url.searchParams.get('preset') || 'PPR') as 'PPR'|'HALF_PPR'|'STANDARD'
-    const passTd = (Number(url.searchParams.get('passTd') || 4) === 6 ? 6 : 4) as 4|6
-    const pos = (url.searchParams.get('pos') || '').toUpperCase()
-    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit') || 50)))
-    const exclude = new Set((url.searchParams.get('exclude') || '')
-      .split(',').map(s => s.trim()).filter(Boolean))
-  
-    // NEW: ids=4866,4034 to fetch specific players
-    const idsParam = url.searchParams.get('ids')
-    const ids = idsParam ? new Set(idsParam.split(',').map(s => s.trim()).filter(Boolean)) : null
-  
-    await ensureProjections(preset, passTd)
-    const rows = _projectionsCache?.rows || []
-  
-    let filtered = rows
-  
-    if (ids) {
-      filtered = rows.filter(r => ids.has(r.player_id))
-    } else {
-      // original position/limit path
-      if (pos && ['QB','RB','WR','TE'].includes(pos)) filtered = filtered.filter(r => r.position === pos)
-      filtered = filtered.filter(r => !exclude.has(r.player_id)).sort((a,b)=>b.ppg - a.ppg).slice(0, limit)
+  const url = new URL(req.url)
+  const preset = (url.searchParams.get('preset') || 'PPR').toUpperCase() as ScoringPreset
+  const passTd = (Number(url.searchParams.get('passTd') || 4) === 6 ? 6 : 4) as 4|6
+  const pos = (url.searchParams.get('pos') || '').toUpperCase()
+  const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit') || 50)))
+  const exclude = new Set((url.searchParams.get('exclude') || '').split(',').map(s => s.trim()).filter(Boolean))
+  const idsParam = url.searchParams.get('ids')
+
+  // ids → pull specific players fast
+  if (idsParam) {
+    const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean)
+    const players = await fetchPlayers()
+    const subset = players.filter(p => ids.includes(p.player_id))
+    const keyPrefix = `${preset}-${passTd}-`
+    const out: ProjectionRow[] = []
+    for (const p of subset) {
+      const k = keyPrefix + p.player_id
+      const cached = IDS_CACHE.get(k)
+      if (cached && Date.now() - cached.at < STALE_MS && cached.row) {
+        out.push(cached.row)
+        continue
+      }
+      const row = (await buildProjectionsFor([p], { preset, passTd }))[0]
+      IDS_CACHE.set(k, { at: Date.now(), row })
+      out.push(row)
     }
-  
-    return new Response(JSON.stringify({
-      updatedAt: _projectionsCache?.at ?? Date.now(),
-      preset,
-      passTd,
-      players: filtered,
-    }), {
-      headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
+    return new Response(JSON.stringify({ preset, passTd, players: out }), {
+      headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
     })
-  }  
+  }
+
+  // pos → build / return per-position cache
+  if (!POSITIONS.includes(pos as PosKey)) {
+    return new Response(JSON.stringify({ error: 'Provide ?pos=QB|RB|WR|TE or ids=...' }), { status: 400 })
+  }
+  const cacheKey = `${preset}-${passTd}-${pos}`
+  const cached = posCache.get(cacheKey)
+  if (cached && Date.now() - cached.at < STALE_MS) {
+    const pruned = cached.rows.filter(r => !exclude.has(r.player_id)).sort((a,b)=>b.ppg-a.ppg).slice(0, limit)
+    return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
+      headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
+    })
+  }
+
+  const all = await fetchPlayers()
+  const subset = all.filter(p => p.position === pos)
+  const rows = await buildProjectionsFor(subset, { preset, passTd })
+  posCache.set(cacheKey, { at: Date.now(), rows })
+
+  const pruned = rows.filter(r => !exclude.has(r.player_id)).sort((a,b)=>b.ppg-a.ppg).slice(0, limit)
+  return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
+    headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
+  })
+}
