@@ -11,12 +11,13 @@ import { Separator } from '@/components/ui/separator'
 import { Loader2, Search, Scale, Info, TrendingUp, X } from 'lucide-react'
 import {
   ResponsiveContainer,
-  BarChart,
-  Bar,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
-  Legend,
   Tooltip as RTooltip,
+  Legend,
+  CartesianGrid,
 } from 'recharts'
 
 /* ============================= Types & helpers ============================= */
@@ -48,16 +49,6 @@ type WeeklyStat = {
   carries?: number
 }
 
-type SeasonSummary = {
-  season: number
-  games: number
-  ppg_ppr: number
-  carries_pg: number
-  targets_pg: number
-  pass_att_pg: number
-  rush_att_pg: number
-}
-
 type ScoringPreset = 'STANDARD' | 'HALF_PPR' | 'PPR'
 
 const PRESET_LABEL: Record<ScoringPreset, string> = {
@@ -78,7 +69,7 @@ function yearsSince(dateISO?: string) {
   return (now.getTime() - d.getTime()) / (365.25 * 24 * 3600 * 1000)
 }
 
-/* =========================== Projection primitives ======================== */
+/* =========================== Scoring & Projection ========================= */
 
 function weeklyPoints(stat: WeeklyStat, preset: ScoringPreset, passTd: 4 | 6) {
   if (preset === 'PPR' && stat.pts_ppr != null) return stat.pts_ppr
@@ -92,27 +83,38 @@ function weeklyPoints(stat: WeeklyStat, preset: ScoringPreset, passTd: 4 | 6) {
   return passPoints + rushPoints + recPoints
 }
 
-function seasonsFromWeekly(weeks: WeeklyStat[], preset: ScoringPreset, passTd: 4 | 6): SeasonSummary[] {
-  const bySeason: Record<number, WeeklyStat[]> = {}
-  weeks.forEach(w => { (bySeason[w.season] ||= []).push(w) })
-  const seasons = Object.entries(bySeason).map(([s, arr]) => {
-    const games = arr.length
-    const total = arr.reduce((sum, w) => sum + weeklyPoints(w, preset, passTd), 0)
-    const carries = arr.reduce((sum, w) => sum + (w.carries ?? 0), 0)
-    const targets = arr.reduce((sum, w) => sum + (w.targets ?? w.rec ?? 0), 0)
-    return {
-      season: Number(s),
-      games,
-      ppg_ppr: games ? total / games : 0,
-      carries_pg: games ? carries / games : 0,
-      targets_pg: games ? targets / games : 0,
-      pass_att_pg: 0,
-      rush_att_pg: games ? carries / games : 0,
-    }
-  })
-  return seasons.sort((a, b) => a.season - b.season)
+/** A game counts as "played" if any meaningful stat was logged (avoids DNPs). */
+function didPlay(w: WeeklyStat): boolean {
+  return (
+    (w.pts_ppr != null && w.pts_ppr !== 0) ||
+    (w.pass_td ?? 0) > 0 ||
+    (w.pass_yd ?? 0) > 0 ||
+    (w.rush_td ?? 0) > 0 ||
+    (w.rush_yd ?? 0) > 0 ||
+    (w.rec ?? 0) > 0 ||
+    (w.rec_td ?? 0) > 0 ||
+    (w.rec_yd ?? 0) > 0 ||
+    (w.targets ?? 0) > 0 ||
+    (w.carries ?? 0) > 0
+  )
 }
 
+/** Return last N *played* game point totals (oldest → newest). */
+function lastNPlayedPoints(
+  weeks: WeeklyStat[],
+  N: number,
+  preset: ScoringPreset,
+  passTd: 4 | 6
+): number[] {
+  const ordered = [...weeks].sort((a, b) => {
+    if (a.season !== b.season) return a.season - b.season
+    return a.week - b.week
+  })
+  const ptsPlayed = ordered.filter(didPlay).map(w => weeklyPoints(w, preset, passTd))
+  return ptsPlayed.slice(Math.max(0, ptsPlayed.length - N))
+}
+
+/** Small, position-specific age multiplier (kept; no half-life). */
 function ageMultiplier(pos: string, age?: number) {
   if (!age) return 1
   let mult = 1
@@ -136,36 +138,17 @@ function ageMultiplier(pos: string, age?: number) {
   return mult
 }
 
-function projectPPG(pos: string, summaries: SeasonSummary[], age?: number) {
-  if (!summaries.length) return 0
-  const recent = summaries.slice(-5) // last 5 seasons in chronological order
-  const lambda = Math.log(2) / 2 // half-life ~2 seasons
-  let weightSum = 0
-  let base = 0
-  for (let i = 0; i < recent.length; i++) {
-    const recIdxFromNow = recent.length - 1 - i // newest gets i=0
-    const w = Math.exp(-lambda * recIdxFromNow)
-    weightSum += w
-    base += w * recent[i].ppg_ppr
-  }
-  base /= weightSum
-
-  const last = recent[recent.length - 1]
-  const meanCarries = recent.reduce((s, r) => s + r.carries_pg, 0) / recent.length
-  const meanTargets = recent.reduce((s, r) => s + r.targets_pg, 0) / recent.length
-  let usageAdj = 0
-  if (pos === 'RB') {
-    const usageLast = 0.35 * last.carries_pg + 1.0 * last.targets_pg
-    const usageMean = 0.35 * meanCarries + 1.0 * meanTargets
-    usageAdj = clamp((usageLast - usageMean) / Math.max(1, usageMean), -0.1, 0.1)
-  } else if (pos === 'WR' || pos === 'TE') {
-    const usageLast = last.targets_pg
-    const usageMean = meanTargets
-    usageAdj = clamp((usageLast - usageMean) / Math.max(1, usageMean), -0.1, 0.12)
-  }
-
-  const ageMult = ageMultiplier(pos, age)
-  return base * (1 + usageAdj) * ageMult
+/** Projection: simple average of last 50 *played* games, then age adjustment. */
+function projectPPG_Last50Avg(
+  weeks: WeeklyStat[],
+  preset: ScoringPreset,
+  passTd: 4 | 6,
+  pos?: string,
+  age?: number
+): number {
+  const pts = lastNPlayedPoints(weeks, 50, preset, passTd)
+  const base = pts.length ? pts.reduce((s, x) => s + x, 0) / pts.length : 0
+  return base * ageMultiplier(pos || '', age)
 }
 
 /* ================================ Hooks =================================== */
@@ -206,14 +189,17 @@ function usePlayerBundle(id?: string, preset: ScoringPreset = 'PPR', passTd: 4 |
     return () => { ignore = true }
   }, [id])
 
-  const summaries = useMemo(() => seasonsFromWeekly(weeks, preset, passTd), [weeks, preset, passTd])
-  const age = useMemo(() => {
-    const yrs = yearsSince(player?.birth_date)
-    return yrs ? Math.floor(yrs) : undefined
-  }, [player?.birth_date])
-  const ppg = useMemo(() => projectPPG(player?.position || '', summaries, age), [player?.position, summaries, age])
+  const ageYears = useMemo(
+    () => (player?.birth_date ? Math.floor(yearsSince(player.birth_date) || 0) : undefined),
+    [player?.birth_date]
+  )
 
-  return { player, summaries, ppg, loading, err }
+  const ppg = useMemo(
+    () => projectPPG_Last50Avg(weeks, preset, passTd, player?.position, ageYears),
+    [weeks, preset, passTd, player?.position, ageYears]
+  )
+
+  return { player, weeks, ppg, loading, err }
 }
 
 /* ============================= UI components ============================== */
@@ -299,7 +285,7 @@ const DEFAULT_SLOTS: SlotDef[] = [
   { key: 'WR3',  label: 'WR3',  types: ['WR'] },
   { key: 'TE1',  label: 'TE',   types: ['TE'] },
 
-  
+  // Bench 1-6 (any position)
   { key: 'BN1',  label: 'Bench 1', types: ['QB','RB','WR','TE'] },
   { key: 'BN2',  label: 'Bench 2', types: ['QB','RB','WR','TE'] },
   { key: 'BN3',  label: 'Bench 3', types: ['QB','RB','WR','TE'] },
@@ -341,7 +327,7 @@ function RosterSlot({
             label="Add player"
             filterPositions={slot.types}
             onPick={(p) => {
-              if (takenIds.has(p.player_id)) return // simple duplicate guard
+              if (takenIds.has(p.player_id)) return // prevent duplicates
               onChange(p)
             }}
           />
@@ -380,21 +366,22 @@ function RosterBuilder({
     return s
   }, [slots])
 
-  const total = Object.entries(slots).reduce((sum, [, p]) => sum + (p ? 1 : 0), 0)
+  const total = Object.values(slots).filter(Boolean).length
 
-  // Compute team projection total by summing live ppg from each slot (small component to reuse hook)
-  const rosterRows = DEFAULT_SLOTS.map(def => {
+  const rows = DEFAULT_SLOTS.map(def => {
     const p = slots[def.key]
-    return <_RosterRow
-      key={def.key}
-      def={def}
-      player={p}
-      setPlayer={(np) => setSlots(prev => ({ ...prev, [def.key]: np }))}
-      preset={preset}
-      passTd={passTd}
-      games={games}
-      takenIds={takenIds}
-    />
+    return (
+      <_RosterRow
+        key={def.key}
+        def={def}
+        player={p}
+        setPlayer={(np) => setSlots(prev => ({ ...prev, [def.key]: np }))}
+        preset={preset}
+        passTd={passTd}
+        games={games}
+        takenIds={takenIds}
+      />
+    )
   })
 
   const projectedTotalPoints = (
@@ -410,7 +397,7 @@ function RosterBuilder({
         </div>
         <Separator className="bg-white/20" />
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {rosterRows}
+          {rows}
         </div>
         <Separator className="bg-white/20" />
         <div className="flex items-center justify-between flex-wrap gap-3">
@@ -448,7 +435,6 @@ function _RosterRow(props: {
 function _SumProjected({
   slots, preset, passTd, games
 }: { slots: Record<string, PlayerLite | null>, preset: ScoringPreset, passTd: 4 | 6, games: number }) {
-  // lightweight aggregator: run the bundle hook per assigned slot
   const bundles = Object.entries(slots).map(([key, p]) => ({
     key,
     p,
@@ -487,17 +473,21 @@ export default function Page() {
     return leftProj > rightProj ? left.full_name : right.full_name
   }, [left, right, leftProj, rightProj])
 
+  // Build chart data from the last 50 played games (oldest → newest)
   const chartData = useMemo(() => {
-    const seasons = Array.from(new Set([
-      ...(leftBundle.summaries?.map(s => s.season) || []),
-      ...(rightBundle.summaries?.map(s => s.season) || []),
-    ])).sort((a,b)=>a-b)
-    return seasons.map(season => ({
-      season,
-      [left?.full_name || 'Left']: leftBundle.summaries.find(s => s.season === season)?.ppg_ppr ?? 0,
-      [right?.full_name || 'Right']: rightBundle.summaries.find(s => s.season === season)?.ppg_ppr ?? 0,
-    }))
-  }, [left?.full_name, right?.full_name, leftBundle.summaries, rightBundle.summaries])
+    const a = lastNPlayedPoints(leftBundle.weeks ?? [], 50, preset, passTd)
+    const b = lastNPlayedPoints(rightBundle.weeks ?? [], 50, preset, passTd)
+    const len = Math.max(a.length, b.length)
+    const rows = []
+    for (let i = 0; i < len; i++) {
+      rows.push({
+        game: i + 1,
+        [left?.full_name || 'Player A']: a[i] ?? null,
+        [right?.full_name || 'Player B']: b[i] ?? null,
+      })
+    }
+    return rows
+  }, [left?.full_name, right?.full_name, leftBundle.weeks, rightBundle.weeks, preset, passTd])
 
   return (
     <TooltipProvider>
@@ -577,7 +567,7 @@ export default function Page() {
                   <div className="text-3xl font-semibold">
                     {leftBundle.loading ? '…' : leftProj.toFixed(1)} <span className="text-base font-normal opacity-80">proj pts</span>
                   </div>
-                  <div className="text-xs opacity-85">≈ {(leftBundle.ppg || 0).toFixed(2)} PPG × {games} games</div>
+                  <div className="text-xs opacity-85">≈ {(leftBundle.ppg || 0).toFixed(2)} PPG × {games} (last 50 played • age-adj)</div>
                 </div>
               ) : (
                 <div className="text-sm opacity-85">Pick <b>Player A</b> above to see projections.</div>
@@ -585,7 +575,7 @@ export default function Page() {
             </CardContent>
           </Card>
 
-            <Card className="bg-white/10 border-white/20 text-white">
+          <Card className="bg-white/10 border-white/20 text-white">
             <CardContent className="p-4 space-y-4">
               {right ? (
                 <div className="space-y-2">
@@ -596,7 +586,7 @@ export default function Page() {
                   <div className="text-3xl font-semibold">
                     {rightBundle.loading ? '…' : rightProj.toFixed(1)} <span className="text-base font-normal opacity-80">proj pts</span>
                   </div>
-                  <div className="text-xs opacity-85">≈ {(rightBundle.ppg || 0).toFixed(2)} PPG × {games} games</div>
+                  <div className="text-xs opacity-85">≈ {(rightBundle.ppg || 0).toFixed(2)} PPG × {games} (last 50 played • age-adj)</div>
                 </div>
               ) : (
                 <div className="text-sm opacity-85">Pick <b>Player B</b> above to see projections.</div>
@@ -605,7 +595,7 @@ export default function Page() {
           </Card>
         </div>
 
-        {/* ======= ROW 4: RECOMMENDATION + CHART ======= */}
+        {/* ======= ROW 4: RECOMMENDATION + LINE CHART ======= */}
         {(left && right) && (
           <Card className="bg-white/10 border-white/20 text-white">
             <CardContent className="p-4 space-y-4">
@@ -613,34 +603,56 @@ export default function Page() {
                 <div className="flex items-center gap-2 text-lg font-semibold">
                   <Scale className="w-5 h-5" /> Draft Recommendation
                 </div>
-                <div className="text-sm opacity-90">Scoring: {PRESET_LABEL[preset]} • Pass TD: {passTd} • Games: {games}</div>
+                <div className="text-sm opacity-90">
+                  Scoring: {PRESET_LABEL[preset]} • Pass TD: {passTd} • Games: {games} • Basis: last 50 played games (age-adj)
+                </div>
               </div>
               <Separator className="bg-white/20" />
               <div className="flex items-center gap-3 text-xl">
                 {leftProj === rightProj
                   ? <span>It’s a <b>coin flip</b> based on your settings.</span>
-                  : <span><b>{leftProj > rightProj ? left.full_name : right.full_name}</b> looks better on projected season points.</span>}
+                  : <span><b>{winner ?? ''}</b> looks better on projected season points.</span>}
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Info className="w-4 h-4 opacity-80" />
                   </TooltipTrigger>
                   <TooltipContent className="max-w-xs text-xs">
-                    Projection = recency-weighted PPG over last 5 seasons (half-life≈2), with small usage and age adjustments.
+                    Projection = simple average of last 50 played games using your scoring, adjusted slightly for age by position.
+                    Chart shows those game-by-game points (older → newer).
                   </TooltipContent>
                 </Tooltip>
               </div>
+
               <div className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={chartData} margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
-                    <XAxis dataKey="season" tick={{ fontSize: 12, fill: '#E8EEF6' }} stroke="#E8EEF6" />
+                  <LineChart data={chartData} margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="game" tick={{ fontSize: 12, fill: '#E8EEF6' }} stroke="#E8EEF6" />
                     <YAxis tick={{ fontSize: 12, fill: '#E8EEF6' }} stroke="#E8EEF6" />
                     <Legend wrapperStyle={{ fontSize: 12, color: '#E8EEF6' }} />
                     <RTooltip formatter={(v: unknown) => (typeof v === 'number' ? v.toFixed(2) : String(v))} />
-                    <Bar dataKey={left?.full_name || 'Left'} />
-                    <Bar dataKey={right?.full_name || 'Right'} />
-                  </BarChart>
+
+                    <Line
+                      type="monotone"
+                      dataKey={left?.full_name || 'Player A'}
+                      dot={false}
+                      strokeWidth={2}
+                      stroke="#20C997"
+                      connectNulls
+                    />
+
+                    <Line
+                      type="monotone"
+                      dataKey={right?.full_name || 'Player B'}
+                      dot={false}
+                      strokeWidth={2}
+                      stroke="#D50A0A"
+                      connectNulls
+                    />
+                  </LineChart>
                 </ResponsiveContainer>
               </div>
+
             </CardContent>
           </Card>
         )}
@@ -652,8 +664,7 @@ export default function Page() {
           <CardContent className="p-4 text-xs space-y-2">
             <div className="flex items-center gap-2 font-medium text-sm"><TrendingUp className="w-4 h-4" /> About the model</div>
             <p className="opacity-90">
-              This is a simple, transparent projection to help with draft decisions. It does <i>not</i> incorporate camp news,
-              depth chart changes, OL grades, schedule difficulty, or Vegas totals. You can plug in a more sophisticated backend later and keep this UI.
+              Transparent projection: average of last 50 played games (equal weight) with a small age adjustment by position.
             </p>
           </CardContent>
         </Card>
