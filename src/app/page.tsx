@@ -1,6 +1,8 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 'use client'
 
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState, useCallback } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -8,17 +10,18 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Separator } from '@/components/ui/separator'
-import { Loader2, Search, Scale, Info, TrendingUp, X } from 'lucide-react'
+import { Loader2, Search, Scale, Info, TrendingUp, X, ChevronDown, ChevronRight, Plus } from 'lucide-react'
 import {
   ResponsiveContainer,
   LineChart,
   Line,
   XAxis,
   YAxis,
-  Tooltip as RTooltip,
   Legend,
+  Tooltip as RTooltip,
   CartesianGrid,
 } from 'recharts'
+
 
 /* ============================= Types & helpers ============================= */
 
@@ -49,8 +52,26 @@ type WeeklyStat = {
   carries?: number
 }
 
-type ScoringPreset = 'STANDARD' | 'HALF_PPR' | 'PPR'
+type ProjectionRow = {
+  player_id: string
+  full_name: string
+  position: 'QB' | 'RB' | 'WR' | 'TE' | string
+  team?: string
+  ppg: number
+}
 
+type SeasonSummary = {
+  season: number
+  games: number
+  ppg_ppr: number
+  carries_pg: number
+  targets_pg: number
+  pass_att_pg: number
+  rush_att_pg: number
+}
+
+
+type ScoringPreset = 'STANDARD' | 'HALF_PPR' | 'PPR'
 const PRESET_LABEL: Record<ScoringPreset, string> = {
   STANDARD: 'Standard',
   HALF_PPR: 'Half-PPR',
@@ -83,6 +104,33 @@ function weeklyPoints(stat: WeeklyStat, preset: ScoringPreset, passTd: 4 | 6) {
   return passPoints + rushPoints + recPoints
 }
 
+function seasonsFromWeekly(
+  weeks: WeeklyStat[],
+  preset: ScoringPreset,
+  passTd: 4 | 6
+): SeasonSummary[] {
+  const bySeason: Record<number, WeeklyStat[]> = {}
+  weeks.forEach(w => { (bySeason[w.season] ||= []).push(w) })
+
+  return Object.entries(bySeason).map(([s, arr]) => {
+    const games = arr.length
+    const total = arr.reduce((sum, w) => sum + weeklyPoints(w, preset, passTd), 0)
+    const carries = arr.reduce((sum, w) => sum + (w.carries ?? 0), 0)
+    const targets = arr.reduce((sum, w) => sum + (w.targets ?? w.rec ?? 0), 0)
+
+    return {
+      season: Number(s),
+      games,
+      ppg_ppr: games ? total / games : 0,
+      carries_pg: games ? carries / games : 0,
+      targets_pg: games ? targets / games : 0,
+      pass_att_pg: 0,
+      rush_att_pg: games ? carries / games : 0,
+    }
+  }).sort((a, b) => a.season - b.season)
+}
+
+
 /** A game counts as "played" if any meaningful stat was logged (avoids DNPs). */
 function didPlay(w: WeeklyStat): boolean {
   return (
@@ -114,7 +162,7 @@ function lastNPlayedPoints(
   return ptsPlayed.slice(Math.max(0, ptsPlayed.length - N))
 }
 
-/** Small, position-specific age multiplier (kept; no half-life). */
+/** Small, position-specific age multiplier. */
 function ageMultiplier(pos: string, age?: number) {
   if (!age) return 1
   let mult = 1
@@ -162,44 +210,73 @@ function useDebounced<T>(val: T, ms = 300) {
   return v
 }
 
-function usePlayerBundle(id?: string, preset: ScoringPreset = 'PPR', passTd: 4 | 6 = 4) {
-  const [player, setPlayer] = useState<PlayerLite | null>(null)
-  const [weeks, setWeeks] = useState<WeeklyStat[]>([])
-  const [loading, setLoading] = useState(false)
-  const [err, setErr] = useState<string | null>(null)
+function usePlayerBundle(
+  id?: string,
+  preset: ScoringPreset = 'PPR',
+  passTd: 4 | 6 = 4
+) {
+  const [player, setPlayer] = React.useState<PlayerLite | null>(null)
+  const [ppg, setPpg] = React.useState<number>(0)
+  const [summaries, setSummaries] = React.useState<SeasonSummary[]>([])
+  const [weeks, setWeeks] = React.useState<WeeklyStat[]>([])   // ← add this
+  const [loading, setLoading] = React.useState(false)
+  const [err, setErr] = React.useState<string | null>(null)
 
-  useEffect(() => {
+  React.useEffect(() => {
     let ignore = false
-    if (!id) { setPlayer(null); setWeeks([]); return }
-    setLoading(true)
-    setErr(null)
-    Promise.all([
-      fetch(`/api/players/by-id?id=${encodeURIComponent(id)}`).then(r => r.json()),
-      fetch(`/api/stats/${id}?seasons=2020,2021,2022,2023,2024`).then(r => r.json()),
-    ])
-      .then(([p, s]: [Record<string, unknown>, Record<string, unknown>]) => {
-        if (ignore) return
-        const pl = (p.player as PlayerLite) ?? null
-        const wk = (s.weeks as WeeklyStat[]) ?? []
-        setPlayer(pl)
-        setWeeks(Array.isArray(wk) ? wk : [])
-      })
-      .catch(() => { if (!ignore) setErr('Failed to load player data') })
-      .finally(() => { if (!ignore) setLoading(false) })
+
+    async function run() {
+      if (!id) {
+        setPlayer(null)
+        setPpg(0)
+        setSummaries([])
+        setWeeks([])                          // ← clear weeks when no id
+        return
+      }
+
+      setLoading(true)
+      setErr(null)
+
+      try {
+        // basic player
+        const pRes = await fetch(`/api/players/by-id?id=${encodeURIComponent(id)}`, { cache: 'no-store' })
+        const pJson = await pRes.json()
+        if (!ignore) setPlayer((pJson.player as PlayerLite) ?? null)
+
+        // projection from cache
+        const projRes = await fetch(`/api/projections?ids=${encodeURIComponent(id)}&preset=${preset}&passTd=${passTd}`, { cache: 'no-store' })
+        if (projRes.ok) {
+          const proj = await projRes.json() as { players: { player_id: string; ppg: number }[] }
+          const row = proj.players?.[0]
+          if (!ignore && row && row.player_id === id) setPpg(row.ppg || 0)
+        } else {
+          if (!ignore) setPpg(0)
+        }
+
+        // weeks for charts (optional)
+        const sRes = await fetch(`/api/stats/${encodeURIComponent(id)}?seasons=2020,2021,2022,2023,2024`, { cache: 'no-store' })
+        if (sRes.ok) {
+          const sJson = await sRes.json() as { weeks: WeeklyStat[] }
+          if (!ignore) {
+            setWeeks(Array.isArray(sJson.weeks) ? sJson.weeks : [])         // ← keep raw weeks
+            setSummaries(seasonsFromWeekly(sJson.weeks || [], preset, passTd))
+          }
+        } else {
+          if (!ignore) { setWeeks([]); setSummaries([]) }
+        }
+      } catch (e: any) {
+        if (!ignore) setErr(e?.message || 'Failed to load player data')
+      } finally {
+        if (!ignore) setLoading(false)
+      }
+    }
+
+    run()
     return () => { ignore = true }
-  }, [id])
+  }, [id, preset, passTd])
 
-  const ageYears = useMemo(
-    () => (player?.birth_date ? Math.floor(yearsSince(player.birth_date) || 0) : undefined),
-    [player?.birth_date]
-  )
-
-  const ppg = useMemo(
-    () => projectPPG_Last50Avg(weeks, preset, passTd, player?.position, ageYears),
-    [weeks, preset, passTd, player?.position, ageYears]
-  )
-
-  return { player, weeks, ppg, loading, err }
+  // ← include weeks in the return shape
+  return { player, summaries, weeks, ppg, loading, err }
 }
 
 /* ============================= UI components ============================== */
@@ -276,7 +353,7 @@ function PlayerSearch({
 
 type SlotDef = { key: string; label: string; types: ('QB'|'RB'|'WR'|'TE')[] }
 
-const DEFAULT_SLOTS: SlotDef[] = [
+const STARTER_SLOTS: SlotDef[] = [
   { key: 'QB1',  label: 'QB',   types: ['QB'] },
   { key: 'RB1',  label: 'RB1',  types: ['RB'] },
   { key: 'RB2',  label: 'RB2',  types: ['RB'] },
@@ -284,8 +361,8 @@ const DEFAULT_SLOTS: SlotDef[] = [
   { key: 'WR2',  label: 'WR2',  types: ['WR'] },
   { key: 'WR3',  label: 'WR3',  types: ['WR'] },
   { key: 'TE1',  label: 'TE',   types: ['TE'] },
-
-  // Bench 1-6 (any position)
+]
+const BENCH_SLOTS: SlotDef[] = [
   { key: 'BN1',  label: 'Bench 1', types: ['QB','RB','WR','TE'] },
   { key: 'BN2',  label: 'Bench 2', types: ['QB','RB','WR','TE'] },
   { key: 'BN3',  label: 'Bench 3', types: ['QB','RB','WR','TE'] },
@@ -293,6 +370,7 @@ const DEFAULT_SLOTS: SlotDef[] = [
   { key: 'BN5',  label: 'Bench 5', types: ['QB','RB','WR','TE'] },
   { key: 'BN6',  label: 'Bench 6', types: ['QB','RB','WR','TE'] },
 ]
+const ALL_SLOTS = [...STARTER_SLOTS, ...BENCH_SLOTS]
 
 function RosterSlot({
   slot,
@@ -327,7 +405,7 @@ function RosterSlot({
             label="Add player"
             filterPositions={slot.types}
             onPick={(p) => {
-              if (takenIds.has(p.player_id)) return // prevent duplicates
+              if (takenIds.has(p.player_id)) return
               onChange(p)
             }}
           />
@@ -357,8 +435,9 @@ function RosterBuilder({
   preset, passTd, games,
 }: { preset: ScoringPreset; passTd: 4 | 6; games: number }) {
   const [slots, setSlots] = useState<Record<string, PlayerLite | null>>(
-    () => Object.fromEntries(DEFAULT_SLOTS.map(s => [s.key, null]))
+    () => Object.fromEntries(ALL_SLOTS.map(s => [s.key, null]))
   )
+  const [benchOpen, setBenchOpen] = useState(true)
 
   const takenIds = useMemo(() => {
     const s = new Set<string>()
@@ -366,44 +445,57 @@ function RosterBuilder({
     return s
   }, [slots])
 
-  const total = Object.values(slots).filter(Boolean).length
-
-  const rows = DEFAULT_SLOTS.map(def => {
-    const p = slots[def.key]
-    return (
-      <_RosterRow
-        key={def.key}
-        def={def}
-        player={p}
-        setPlayer={(np) => setSlots(prev => ({ ...prev, [def.key]: np }))}
-        preset={preset}
-        passTd={passTd}
-        games={games}
-        takenIds={takenIds}
-      />
-    )
-  })
-
-  const projectedTotalPoints = (
-    <_SumProjected slots={slots} preset={preset} passTd={passTd} games={games} />
-  )
+  const startersFilled = STARTER_SLOTS.reduce((n, s) => n + (slots[s.key] ? 1 : 0), 0)
+  const benchFilled = BENCH_SLOTS.reduce((n, s) => n + (slots[s.key] ? 1 : 0), 0)
 
   return (
     <Card className="bg-white/10 border-white/20 text-white">
       <CardContent className="p-4 space-y-4">
-        <div className="flex items-center justify-between flex-wrap gap-2">
-          <div className="text-lg font-semibold">Roster Builder</div>
-          <div className="text-sm opacity-90">Slots filled: {total} / {DEFAULT_SLOTS.length}</div>
+        <div className="text-lg font-semibold">Starters</div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {STARTER_SLOTS.map(def => (
+            <_RosterRow
+              key={def.key}
+              def={def}
+              player={slots[def.key]}
+              setPlayer={(np) => setSlots(prev => ({ ...prev, [def.key]: np }))}
+              preset={preset}
+              passTd={passTd}
+              games={games}
+              takenIds={takenIds}
+            />
+          ))}
         </div>
+
         <Separator className="bg-white/20" />
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {rows}
-        </div>
+
+        <button
+          className="w-full flex items-center justify-between px-2 py-2 rounded-lg hover:bg-white/10 transition"
+          onClick={() => setBenchOpen(o => !o)}
+        >
+          <div className="text-lg font-semibold">Bench</div>
+          {benchOpen ? <ChevronDown className="w-4 h-4 ml-auto" /> : <ChevronRight className="w-4 h-4 ml-auto" />}
+        </button>
+
+        {benchOpen && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {BENCH_SLOTS.map(def => (
+              <_RosterRow
+                key={def.key}
+                def={def}
+                player={slots[def.key]}
+                setPlayer={(np) => setSlots(prev => ({ ...prev, [def.key]: np }))}
+                preset={preset}
+                passTd={passTd}
+                games={games}
+                takenIds={takenIds}
+              />
+            ))}
+          </div>
+        )}
+
         <Separator className="bg-white/20" />
-        <div className="flex items-center justify-between flex-wrap gap-3">
-          <div className="text-sm opacity-85">Bench accepts any position (QB / RB / WR / TE)</div>
-          {projectedTotalPoints}
-        </div>
+        <_SumProjected slots={slots} preset={preset} passTd={passTd} games={games} />
       </CardContent>
     </Card>
   )
@@ -443,10 +535,286 @@ function _SumProjected({
   const totalPPG = bundles.reduce((sum, r) => sum + (r.p ? (r.bundle.ppg || 0) : 0), 0)
   const totalSeason = totalPPG * games
   return (
-    <div className="text-right">
-      <div className="text-xs opacity-80">Roster projection</div>
-      <div className="text-xl font-semibold">{totalSeason.toFixed(1)} <span className="text-sm font-normal opacity-80">pts</span></div>
-      <div className="text-xs opacity-75">≈ {totalPPG.toFixed(2)} PPG × {games}</div>
+    <div className="flex items-center justify-between flex-wrap gap-3">
+      <div className="text-sm opacity-85">Bench accepts any position (QB / RB / WR / TE)</div>
+      <div className="text-right">
+        <div className="text-xs opacity-80">Roster projection</div>
+        <div className="text-xl font-semibold">{totalSeason.toFixed(1)} <span className="text-sm font-normal opacity-80">pts</span></div>
+        <div className="text-xs opacity-75">≈ {totalPPG.toFixed(2)} PPG × {games}</div>
+      </div>
+    </div>
+  )
+}
+
+/* =============================== Draft Order ============================== */
+
+type DraftPick = { id: string; team: string; player: PlayerLite }
+
+function DraftOrder({
+  draftedIds,
+  onChange,
+}: {
+  draftedIds: Set<string>
+  onChange: (picks: DraftPick[]) => void
+}) {
+  const [teams, setTeams] = useState<string[]>([])
+  const [picks, setPicks] = useState<DraftPick[]>([])
+
+  // form state
+  const [newTeam, setNewTeam] = useState('')
+  const [pickTeam, setPickTeam] = useState<string>('')
+  const [pendingPlayer, setPendingPlayer] = useState<PlayerLite | null>(null)
+
+  // hydrate
+  useEffect(() => {
+    try {
+      const t = localStorage.getItem('draft_teams_v1')
+      const p = localStorage.getItem('draft_picks_v1')
+      if (t) setTeams(JSON.parse(t))
+      if (p) setPicks(JSON.parse(p))
+    } catch {}
+  }, [])
+
+  // persist
+  useEffect(() => {
+    localStorage.setItem('draft_teams_v1', JSON.stringify(teams))
+  }, [teams])
+  useEffect(() => {
+    localStorage.setItem('draft_picks_v1', JSON.stringify(picks))
+    onChange(picks)
+  }, [picks, onChange])
+
+  // teams crud
+  const addTeam = () => {
+    const name = newTeam.trim()
+    if (!name) return
+    if (teams.some(t => t.toLowerCase() === name.toLowerCase())) return
+    const next = [...teams, name]
+    setTeams(next)
+    setNewTeam('')
+    if (!pickTeam) setPickTeam(name)
+  }
+  const removeTeam = (name: string) => {
+    const next = teams.filter(t => t !== name)
+    setTeams(next)
+    if (pickTeam === name) setPickTeam(next[0] ?? '')
+    // also strip any picks tied to that team
+    setPicks(prev => prev.filter(p => p.team !== name))
+  }
+  const clearAll = () => {
+    setTeams([])
+    setPicks([])
+    setPickTeam('')
+    setPendingPlayer(null)
+    localStorage.removeItem('draft_teams_v1')
+    localStorage.removeItem('draft_picks_v1')
+  }
+
+  // picks
+  const addPick = () => {
+    if (!pickTeam || !pendingPlayer) return
+    const newPick: DraftPick = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      team: pickTeam,
+      player: pendingPlayer,
+    }
+    setPicks(prev => [newPick, ...prev])
+    setPendingPlayer(null)
+  }
+  const removePick = (id: string) => setPicks(prev => prev.filter(p => p.id !== id))
+
+  return (
+    <Card className="bg-white/10 border-white/20 text-white">
+      <CardContent className="p-4 space-y-6">
+        <div className="flex items-center justify-between">
+          <div className="text-lg font-semibold">Draft Order</div>
+          <Button variant="ghost" size="sm" onClick={clearAll}>Clear All</Button>
+        </div>
+
+        {/* Teams first */}
+        <div className="space-y-3">
+          <div className="text-sm font-medium">Teams / Managers (enter all first)</div>
+          <div className="flex gap-2">
+            <Input
+              placeholder="Team or Manager name"
+              value={newTeam}
+              onChange={(e) => setNewTeam(e.target.value)}
+            />
+            <Button onClick={addTeam}><Plus className="w-4 h-4 mr-2" />Add</Button>
+          </div>
+          {teams.length === 0 ? (
+            <div className="text-sm opacity-75">No teams yet. Add them above.</div>
+          ) : (
+            <div className="space-y-2">
+              {teams.map((t) => (
+                <div key={t} className="rounded border border-white/15 bg-white/5 px-3 py-2 flex items-center justify-between">
+                  <div className="text-sm">{t}</div>
+                  <Button variant="ghost" size="icon" onClick={() => removeTeam(t)} aria-label="Remove team">
+                    <X className="w-4 h-4" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <Separator className="bg-white/20" />
+
+        {/* Make a pick */}
+        <div className="space-y-3">
+          <div className="text-sm font-medium">Make Pick</div>
+
+          <div className="grid grid-cols-1 gap-3">
+            <div>
+              <Label className="text-xs">Team</Label>
+              <Select value={pickTeam} onValueChange={setPickTeam}>
+                <SelectTrigger className="mt-1">
+                  <SelectValue placeholder="Select a team" />
+                </SelectTrigger>
+
+                {/* Dark dropdown panel */}
+                <SelectContent
+                  className="bg-[#0B1220]/95 text-slate-100 border border-white/10 backdrop-blur-md shadow-xl"
+                  position="popper"
+                  sideOffset={6}
+                >
+                  {teams.map((t) => (
+                    <SelectItem
+                      key={t}
+                      value={t}
+                      className="text-slate-100 focus:bg-white/10 focus:text-white data-[state=checked]:bg-white/15 data-[state=checked]:text-white"
+                    >
+                      {t}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+            </div>
+
+            <PlayerSearch label="Select drafted player" onPick={setPendingPlayer} />
+
+            <Button className="w-full" disabled={!pickTeam || !pendingPlayer} onClick={addPick}>
+              <Plus className="w-4 h-4 mr-2" /> Add Pick to {pickTeam || 'Team'}
+            </Button>
+          </div>
+        </div>
+
+        <Separator className="bg-white/20" />
+
+        {/* Picks log */}
+        <div className="space-y-2 max-h-[420px] overflow-auto pr-1">
+          {picks.length === 0 && <div className="text-sm opacity-75">No picks yet. Use “Make Pick”.</div>}
+          {picks.map(p => (
+            <div key={p.id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold truncate">{p.player.full_name}</div>
+                <div className="text-xs opacity-80 truncate">{p.player.position}{p.player.team ? ` • ${p.player.team}` : ''}</div>
+                <div className="text-xs opacity-70 truncate">Drafted by {p.team}</div>
+              </div>
+              <Button variant="ghost" size="icon" onClick={() => removePick(p.id)}>
+                <X className="w-4 h-4" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+
+/* ============================== Best Available ============================ */
+
+function BestAvailable({
+  draftedIds,
+  preset,
+  passTd,
+}: {
+  draftedIds: Set<string>
+  preset: ScoringPreset
+  passTd: 4 | 6
+}) {
+  const limits = { QB: 5, TE: 5, RB: 10, WR: 10 } as const
+
+  return (
+    <Card className="bg-white/10 border-white/20 text-white">
+      <CardContent className="p-4 space-y-6">
+        <div className="text-lg font-semibold">Best Available</div>
+        <div className="text-xs opacity-70">First load may take a bit while projections build. Afterwards, it’s instant (cached).</div>
+
+        <TopForPosition pos="QB" title="Quarterbacks" limit={limits.QB} draftedIds={draftedIds} preset={preset} passTd={passTd} />
+        <TopForPosition pos="RB" title="Running Backs" limit={limits.RB} draftedIds={draftedIds} preset={preset} passTd={passTd} />
+        <TopForPosition pos="WR" title="Wide Receivers" limit={limits.WR} draftedIds={draftedIds} preset={preset} passTd={passTd} />
+        <TopForPosition pos="TE" title="Tight Ends" limit={limits.TE} draftedIds={draftedIds} preset={preset} passTd={passTd} />
+      </CardContent>
+    </Card>
+  )
+}
+
+function TopForPosition({
+  pos, title, limit, draftedIds, preset, passTd,
+}: {
+  pos: 'QB' | 'RB' | 'WR' | 'TE'
+  title: string
+  limit: number
+  draftedIds: Set<string>
+  preset: ScoringPreset
+  passTd: 4 | 6
+}) {
+  const [rows, setRows] = React.useState<ProjectionRow[] | null>(null)
+  const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    let ignore = false
+
+    async function run() {
+      setLoading(true); setError(null); setRows(null)
+      try {
+        const exclude = Array.from(draftedIds).join(',')
+        const res = await fetch(`/api/projections?pos=${pos}&limit=${limit}&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}`, { cache: 'no-store' })
+        if (!res.ok) throw new Error(`projections failed ${res.status}`)
+        const json = await res.json() as { players: ProjectionRow[] }
+        if (!ignore) setRows(json.players || [])
+      } catch (e: any) {
+        if (!ignore) setError(e?.message || 'Failed to load')
+      } finally {
+        if (!ignore) setLoading(false)
+      }
+    }
+
+    run()
+    return () => { ignore = true }
+  }, [pos, limit, draftedIds, preset, passTd])
+
+  return (
+    <div className="space-y-3">
+      <div className="text-sm font-semibold uppercase tracking-wide opacity-90">{title}</div>
+
+      {loading && <div className="text-sm opacity-75">Loading best available {title.toLowerCase()}…</div>}
+      {error && !loading && <div className="text-sm text-red-300">{error}</div>}
+      {!loading && !error && (!rows || rows.length === 0) && (
+        <div className="text-sm opacity-75">No eligible players found.</div>
+      )}
+
+      {!!rows && rows.length > 0 && (
+        <div className="space-y-2">
+          {rows.map((r) => (
+            <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold truncate">{r.full_name}</div>
+                <div className="text-xs opacity-80 truncate">
+                  {r.position}{r.team ? ` • ${r.team}` : ''}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-base font-semibold">{r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span></div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -454,40 +822,52 @@ function _SumProjected({
 /* ================================== Page ================================== */
 
 export default function Page() {
-  // state
+  // settings
   const [preset, setPreset] = useState<ScoringPreset>('PPR')
   const [passTd, setPassTd] = useState<4 | 6>(4)
   const [games, setGames] = useState(17)
+
+  // players for compare
   const [left, setLeft] = useState<PlayerLite | null>(null)
   const [right, setRight] = useState<PlayerLite | null>(null)
-
   const leftBundle = usePlayerBundle(left?.player_id, preset, passTd)
   const rightBundle = usePlayerBundle(right?.player_id, preset, passTd)
-
   const leftProj = useMemo(() => (leftBundle.ppg || 0) * games, [leftBundle.ppg, games])
   const rightProj = useMemo(() => (rightBundle.ppg || 0) * games, [rightBundle.ppg, games])
-
   const winner = useMemo(() => {
     if (!left || !right) return null
     if (leftProj === rightProj) return 'Tie'
     return leftProj > rightProj ? left.full_name : right.full_name
   }, [left, right, leftProj, rightProj])
 
-  // Build chart data from the last 50 played games (oldest → newest)
-  const chartData = useMemo(() => {
-    const a = lastNPlayedPoints(leftBundle.weeks ?? [], 50, preset, passTd)
-    const b = lastNPlayedPoints(rightBundle.weeks ?? [], 50, preset, passTd)
-    const len = Math.max(a.length, b.length)
-    const rows = []
-    for (let i = 0; i < len; i++) {
-      rows.push({
-        game: i + 1,
-        [left?.full_name || 'Player A']: a[i] ?? null,
-        [right?.full_name || 'Player B']: b[i] ?? null,
-      })
-    }
-    return rows
-  }, [left?.full_name, right?.full_name, leftBundle.weeks, rightBundle.weeks, preset, passTd])
+// last 50 *played* games -> numbers only
+const chartData = useMemo(() => {
+  const a = lastNPlayedPoints(leftBundle.weeks || [], 50, preset, passTd);
+  const b = lastNPlayedPoints(rightBundle.weeks || [], 50, preset, passTd);
+
+  // reverse so older -> newer on the x-axis (optional)
+  const A = a.slice().reverse();
+  const B = b.slice().reverse();
+
+  const len = Math.max(A.length, B.length);
+  if (len === 0) return [];
+
+  const rows: Array<Record<string, number>> = [];
+  for (let i = 0; i < len; i++) {
+    const row: Record<string, number> = { game: i + 1 };
+    if (A[i] != null) row[left?.full_name || 'Player A'] = Number(A[i]);
+    if (B[i] != null) row[right?.full_name || 'Player B'] = Number(B[i]);
+    rows.push(row);
+  }
+  return rows;
+}, [left?.full_name, right?.full_name, leftBundle.weeks, rightBundle.weeks, preset, passTd]);
+
+
+  // draftedIds from DraftOrder (lift state)
+  const [draftedIds, setDraftedIds] = useState<Set<string>>(new Set())
+  const handleDraftChange = useCallback((picks: DraftPick[]) => {
+    setDraftedIds(new Set(picks.map(p => p.player.player_id)))
+  }, [])
 
   return (
     <TooltipProvider>
@@ -501,7 +881,7 @@ export default function Page() {
       </header>
 
       <main className="p-6 max-w-7xl mx-auto space-y-6">
-        {/* ======= ROW 1: PRESET BOX ======= */}
+        {/* ======= PRESET BOX ======= */}
         <Card className="bg-white/10 border-white/20 text-white">
           <CardContent className="p-4">
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
@@ -540,7 +920,7 @@ export default function Page() {
           </CardContent>
         </Card>
 
-        {/* ======= ROW 2: PLAYER PICKER BOXES ======= */}
+        {/* ======= PLAYER PICKERS ======= */}
         <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
           <Card className="bg-white/10 border-white/20 text-white">
             <CardContent className="p-4">
@@ -554,7 +934,7 @@ export default function Page() {
           </Card>
         </div>
 
-        {/* ======= ROW 3: SUMMARY CARDS ======= */}
+        {/* ======= SUMMARY CARDS ======= */}
         <div className="grid md:grid-cols-2 gap-6">
           <Card className="bg-white/10 border-white/20 text-white">
             <CardContent className="p-4 space-y-4">
@@ -595,8 +975,8 @@ export default function Page() {
           </Card>
         </div>
 
-        {/* ======= ROW 4: RECOMMENDATION + LINE CHART ======= */}
-        {(left && right) && (
+        {/* ======= RECOMMENDATION + CHART ======= */}
+        {left && right && (
           <Card className="bg-white/10 border-white/20 text-white">
             <CardContent className="p-4 space-y-4">
               <div className="flex items-center justify-between gap-4 flex-wrap">
@@ -604,50 +984,75 @@ export default function Page() {
                   <Scale className="w-5 h-5" /> Draft Recommendation
                 </div>
                 <div className="text-sm opacity-90">
-                  Scoring: {PRESET_LABEL[preset]} • Pass TD: {passTd} • Games: {games} • Basis: last 50 played games (age-adj)
+                  Scoring: {PRESET_LABEL[preset]} • Pass TD: {passTd} • Games: {games}
                 </div>
               </div>
               <Separator className="bg-white/20" />
               <div className="flex items-center gap-3 text-xl">
-                {leftProj === rightProj
-                  ? <span>It’s a <b>coin flip</b> based on your settings.</span>
-                  : <span><b>{winner ?? ''}</b> looks better on projected season points.</span>}
+                {leftProj === rightProj ? (
+                  <span>It’s a <b>coin flip</b> based on your settings.</span>
+                ) : (
+                  <span>
+                    <b>{leftProj > rightProj ? left?.full_name : right?.full_name}</b> looks better on projected season points.
+                  </span>
+                )}
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Info className="w-4 h-4 opacity-80" />
                   </TooltipTrigger>
                   <TooltipContent className="max-w-xs text-xs">
-                    Projection = simple average of last 50 played games using your scoring, adjusted slightly for age by position.
-                    Chart shows those game-by-game points (older → newer).
+                    Projection = average of last 50 *played* games (equal weight) with a small age adjustment by position.
                   </TooltipContent>
                 </Tooltip>
               </div>
 
+              {/* your line/bar chart stays here */}
               <div className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={chartData} margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="game" tick={{ fontSize: 12, fill: '#E8EEF6' }} stroke="#E8EEF6" />
-                    <YAxis tick={{ fontSize: 12, fill: '#E8EEF6' }} stroke="#E8EEF6" />
-                    <Legend wrapperStyle={{ fontSize: 12, color: '#E8EEF6' }} />
-                    <RTooltip formatter={(v: unknown) => (typeof v === 'number' ? v.toFixed(2) : String(v))} />
+                    {/* dashed background grid (remove this line if you don't want a grid) */}
+                    <CartesianGrid strokeDasharray="3 6" stroke="#94a3b866" />
 
+                    <XAxis
+                      dataKey="game"
+                      tick={{ fontSize: 12, fill: '#E8EEF6' }}
+                      stroke="#E8EEF6"
+                    />
+                    <YAxis
+                      tick={{ fontSize: 12, fill: '#E8EEF6' }}
+                      stroke="#E8EEF6"
+                      domain={[0, 'auto']}
+                    />
+
+                    <Legend wrapperStyle={{ fontSize: 12, color: '#E8EEF6' }} />
+                    <RTooltip
+                      formatter={(v: unknown) =>
+                        typeof v === 'number' ? v.toFixed(2) : String(v)
+                      }
+                      labelFormatter={(g) => `Game ${g}`}
+                    />
+
+                    {/* Player A = teal/aquamarine */}
                     <Line
                       type="monotone"
                       dataKey={left?.full_name || 'Player A'}
+                      stroke="#10b981"     // teal
+                      strokeWidth={2.5}
                       dot={false}
-                      strokeWidth={2}
-                      stroke="#20C997"
+                      activeDot={{ r: 4 }}
                       connectNulls
+                      isAnimationActive={false}
                     />
-
+                    {/* Player B = red */}
                     <Line
                       type="monotone"
                       dataKey={right?.full_name || 'Player B'}
+                      stroke="#ef4444"     // red
+                      strokeWidth={2.5}
                       dot={false}
-                      strokeWidth={2}
-                      stroke="#D50A0A"
+                      activeDot={{ r: 4 }}
                       connectNulls
+                      isAnimationActive={false}
                     />
                   </LineChart>
                 </ResponsiveContainer>
@@ -657,17 +1062,31 @@ export default function Page() {
           </Card>
         )}
 
-        {/* ======= ROW 5: ROSTER BUILDER ======= */}
-        <RosterBuilder preset={preset} passTd={passTd} games={games} />
+        {/* ======= ROW 5: 3-COLUMN SECTION ======= */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left: Starters + Bench */}
+          <RosterBuilder preset={preset} passTd={passTd} games={games} />
 
+          {/* Middle: Draft Order */}
+          <DraftOrder draftedIds={draftedIds} onChange={handleDraftChange} />
+
+          {/* Right: Best Available (auto-populates; excludes drafted) */}
+          <BestAvailable draftedIds={draftedIds} preset={preset} passTd={passTd} />
+        </div>
+
+        {/* (Optional) About card — leave if you want; Best Available is NOT duplicated anymore */}
         <Card className="bg-white/10 border-white/20 text-white">
           <CardContent className="p-4 text-xs space-y-2">
-            <div className="flex items-center gap-2 font-medium text-sm"><TrendingUp className="w-4 h-4" /> About the model</div>
+            <div className="flex items-center gap-2 font-medium text-sm">
+              <TrendingUp className="w-4 h-4" /> About the model
+            </div>
             <p className="opacity-90">
               Transparent projection: average of last 50 played games (equal weight) with a small age adjustment by position.
+              “Best Available” auto-ranks per position and hides players already drafted in Draft Order.
             </p>
           </CardContent>
         </Card>
+
       </main>
     </TooltipProvider>
   )
