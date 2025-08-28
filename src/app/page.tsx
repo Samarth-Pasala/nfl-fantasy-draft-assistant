@@ -186,6 +186,29 @@ function ageMultiplier(pos: string, age?: number) {
   return mult
 }
 
+function average(xs: number[]) {
+  return xs.length ? xs.reduce((a,b)=>a+b,0) / xs.length : 0
+}
+
+function ppgFromLastN(
+  weeks: WeeklyStat[],
+  preset: ScoringPreset,
+  passTd: 4 | 6,
+  position?: string,
+  birthDateISO?: string
+) {
+  const pts = lastNPlayedPoints(weeks, 50, preset, passTd) // you already have this helper
+  const base = average(pts)
+
+  const ageYears = yearsSince(birthDateISO)
+  const age = typeof ageYears === 'number' ? Math.floor(ageYears) : undefined
+  const mult = ageMultiplier(position || '', age)
+
+  const ppg = base * mult
+  return Number.isFinite(ppg) ? ppg : 0
+}
+
+
 /** Projection: simple average of last 50 *played* games, then age adjustment. */
 function projectPPG_Last50Avg(
   weeks: WeeklyStat[],
@@ -827,18 +850,48 @@ export default function Page() {
   const [passTd, setPassTd] = useState<4 | 6>(4)
   const [games, setGames] = useState(17)
 
-  // players for compare
-  const [left, setLeft] = useState<PlayerLite | null>(null)
-  const [right, setRight] = useState<PlayerLite | null>(null)
-  const leftBundle = usePlayerBundle(left?.player_id, preset, passTd)
-  const rightBundle = usePlayerBundle(right?.player_id, preset, passTd)
-  const leftProj = useMemo(() => (leftBundle.ppg || 0) * games, [leftBundle.ppg, games])
-  const rightProj = useMemo(() => (rightBundle.ppg || 0) * games, [rightBundle.ppg, games])
-  const winner = useMemo(() => {
-    if (!left || !right) return null
-    if (leftProj === rightProj) return 'Tie'
-    return leftProj > rightProj ? left.full_name : right.full_name
-  }, [left, right, leftProj, rightProj])
+// players for compare
+const [left, setLeft] = useState<PlayerLite | null>(null)
+const [right, setRight] = useState<PlayerLite | null>(null)
+
+const leftBundle = usePlayerBundle(left?.player_id, preset, passTd)
+const rightBundle = usePlayerBundle(right?.player_id, preset, passTd)
+
+// PPG from last 50 *played* games (age-adjusted)
+const leftPPG = useMemo(
+  () =>
+    ppgFromLastN(
+      leftBundle.weeks || [],
+      preset,
+      passTd,
+      leftBundle.player?.position,
+      leftBundle.player?.birth_date
+    ),
+  [leftBundle.weeks, preset, passTd, leftBundle.player?.position, leftBundle.player?.birth_date]
+)
+
+const rightPPG = useMemo(
+  () =>
+    ppgFromLastN(
+      rightBundle.weeks || [],
+      preset,
+      passTd,
+      rightBundle.player?.position,
+      rightBundle.player?.birth_date
+    ),
+  [rightBundle.weeks, preset, passTd, rightBundle.player?.position, rightBundle.player?.birth_date]
+)
+
+// season totals
+const leftProj = useMemo(() => leftPPG * games, [leftPPG, games])
+const rightProj = useMemo(() => rightPPG * games, [rightPPG, games])
+
+const winner = useMemo(() => {
+  if (!left || !right) return null
+  if (Math.abs(leftProj - rightProj) < 1e-9) return 'Tie'
+  return leftProj > rightProj ? left.full_name : right.full_name
+}, [left, right, leftProj, rightProj])
+
 
 // last 50 *played* games -> numbers only
 const chartData = useMemo(() => {
