@@ -800,8 +800,12 @@ function TopForPosition({
         if (!res.ok) throw new Error(`projections failed ${res.status}`)
         const json = (await res.json()) as { players: ProjectionRow[] }
         const norm = (s?: string) => String(s || '').toUpperCase().trim()
-        const filtered = (json.players || []).filter(p => norm(p.position) === pos)
-        if (!ignore) setRows(filtered)
+        const rowsFromApi = Array.isArray(json.players) ? json.players : []
+        
+        // Try to filter by position if the row has one.
+        // If filtering removes everything (or rows lack `position`), fall back to the raw list.
+        const filtered = rowsFromApi.filter(r => r.position && norm(r.position) === pos)
+        if (!ignore) setRows(filtered.length ? filtered : rowsFromApi)
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
