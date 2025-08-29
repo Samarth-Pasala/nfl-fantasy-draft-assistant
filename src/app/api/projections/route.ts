@@ -38,8 +38,7 @@ type ProjectionRow = {
   ppg: number
 }
 
-/* ---------------- helpers ---------------- */
-
+// ---------------- helpers (same as your page) ----------------
 function weeklyPoints(stat: WeeklyStat, preset: ScoringPreset, passTd: 4 | 6) {
   if (preset === 'PPR' && stat.pts_ppr != null) return stat.pts_ppr
   if (preset === 'HALF_PPR' && stat.pts_half_ppr != null) return stat.pts_half_ppr
@@ -105,8 +104,7 @@ function average(arr: number[]) {
   return arr.reduce((a, b) => a + b, 0) / arr.length
 }
 
-/* ---------------- fetchers ---------------- */
-
+// ---------------- small fetchers ----------------
 async function fetchPlayers(): Promise<PlayerLite[]> {
   const r = await fetch('https://api.sleeper.app/v1/players/nfl', { cache: 'no-store' })
   const json = await r.json()
@@ -137,26 +135,30 @@ async function fetchWeek(season: number, week: number): Promise<any[]> {
   return []
 }
 
-/* ---------------- caching ---------------- */
-
+// ---------------- in-memory cache ----------------
 type PosKey = 'QB'|'RB'|'WR'|'TE'
 const POSITIONS: PosKey[] = ['QB','RB','WR','TE']
 
-const posCache = new Map<string, { at: number; rows: ProjectionRow[] }>() // key: `${preset}-${passTd}-${pos}`
-const IDS_CACHE = new Map<string, { at: number; row?: ProjectionRow }>()   // key: `${preset}-${passTd}-${id}`
+const posCache = new Map<
+  string, // key: `${preset}-${passTd}-${pos}`
+  { at: number; rows: ProjectionRow[] }
+>()
+const IDS_CACHE = new Map<
+  string, // key: `${preset}-${passTd}-${id}`
+  { at: number; row?: ProjectionRow }
+>()
 
-const STALE_MS = 12 * 60 * 60 * 1000 // 12h
-const SEASONS_DEFAULT = [2023, 2024] // tightened to reduce timeouts
+const STALE_MS = 12 * 60 * 60 * 1000 // 12 hours
+const SEASONS_DEFAULT = [2022, 2023, 2024]
 
-/* ---------------- core builder ---------------- */
-
+// Build projections for a subset of players (one position OR a few ids)
 async function buildProjectionsFor(
   players: PlayerLite[],
   opts: { preset: ScoringPreset; passTd: 4|6; seasons?: number[] }
 ): Promise<ProjectionRow[]> {
   const seasons = opts.seasons ?? SEASONS_DEFAULT
 
-  // pull weeks (keep it bounded so Netlify doesn’t 504)
+  // 1) pull weekly stats and bucket by player
   const weeks: any[][] = []
   for (const season of seasons) {
     for (let wk = 1; wk <= 18; wk++) {
@@ -193,6 +195,7 @@ async function buildProjectionsFor(
     }
   }
 
+  // 2) compute ppg (last 50 played + age adj)
   const rows: ProjectionRow[] = []
   for (const p of players) {
     const arr = bucket.get(p.player_id) ?? []
@@ -212,39 +215,17 @@ async function buildProjectionsFor(
   return rows
 }
 
-/* ------- helper to get rows for one position (with cache) ------- */
-
-async function getRowsForPos(
-  pos: PosKey,
-  preset: ScoringPreset,
-  passTd: 4|6,
-  seasons?: number[]
-): Promise<ProjectionRow[]> {
-  const cacheKey = `${preset}-${passTd}-${pos}`
-  const cached = posCache.get(cacheKey)
-  if (cached && Date.now() - cached.at < STALE_MS) return cached.rows
-
-  const all = await fetchPlayers()
-  const subset = all.filter(p => p.position === pos)
-  const rows = await buildProjectionsFor(subset, { preset, passTd, seasons })
-  posCache.set(cacheKey, { at: Date.now(), rows })
-  return rows
-}
-
-/* ---------------- handler ---------------- */
-
 export async function GET(req: Request) {
   const url = new URL(req.url)
   const preset = (url.searchParams.get('preset') || 'PPR').toUpperCase() as ScoringPreset
   const passTd = (Number(url.searchParams.get('passTd') || 4) === 6 ? 6 : 4) as 4|6
-  const posParam = (url.searchParams.get('pos') || '').toUpperCase()
+  const pos = (url.searchParams.get('pos') || '').toUpperCase()
   const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit') || 50)))
   const exclude = new Set((url.searchParams.get('exclude') || '').split(',').map(s => s.trim()).filter(Boolean))
-  const idsParam = url.searchParams.get('ids')
   const fast = url.searchParams.get('fast') === '1'
-  const seasons = fast ? [2024] : SEASONS_DEFAULT
+  const idsParam = url.searchParams.get('ids')
 
-  // ids → quick single-player projections
+  // ---------- ids → specific players ----------
   if (idsParam) {
     const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean)
     const players = await fetchPlayers()
@@ -258,7 +239,7 @@ export async function GET(req: Request) {
         out.push(cached.row)
         continue
       }
-      const row = (await buildProjectionsFor([p], { preset, passTd, seasons }))[0]
+      const row = (await buildProjectionsFor([p], { preset, passTd }))[0]
       IDS_CACHE.set(k, { at: Date.now(), row })
       out.push(row)
     }
@@ -267,14 +248,35 @@ export async function GET(req: Request) {
     })
   }
 
-  // ALL → merge all four positions server-side (reuses caches if present)
-  if (posParam === 'ALL') {
-    const lists = await Promise.all(
-      (POSITIONS as PosKey[]).map(p => getRowsForPos(p, preset, passTd, seasons))
-    )
-    const merged = lists.flat()
+  // ---------- ALL → merge per-position (respect exclude) ----------
+  if (pos === 'ALL') {
+    let merged: ProjectionRow[] = []
+
+    for (const P of POSITIONS) {
+      const cacheKey = `${preset}-${passTd}-${P}`
+      const cached = posCache.get(cacheKey)
+
+      if (cached && Date.now() - cached.at < STALE_MS) {
+        merged = merged.concat(cached.rows)
+        continue
+      }
+
+      if (fast) {
+        // Fast mode: skip building if not cached
+        continue
+      }
+
+      // Build and cache this position
+      const all = await fetchPlayers()
+      const subset = all.filter(p => p.position === P)
+      const rows = await buildProjectionsFor(subset, { preset, passTd })
+      posCache.set(cacheKey, { at: Date.now(), rows })
+      merged = merged.concat(rows)
+    }
+
+    // filter + sort + slice
     const pruned = merged
-      .filter(r => !exclude.has(r.player_id))
+      .filter(r => r && !exclude.has(r.player_id))
       .sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
       .slice(0, limit)
 
@@ -283,23 +285,40 @@ export async function GET(req: Request) {
     })
   }
 
-  // single-position mode
-  if (!(['QB','RB','WR','TE'] as string[]).includes(posParam)) {
-    return new Response(JSON.stringify({ error: 'Provide ?pos=QB|RB|WR|TE|ALL or ids=...' }), { status: 400 })
+  // ---------- per-position ----------
+  if (!POSITIONS.includes(pos as PosKey)) {
+    return new Response(JSON.stringify({ error: 'Provide ?pos=QB|RB|WR|TE or pos=ALL or ids=...' }), { status: 400 })
   }
 
-  const pos = posParam as PosKey
   const cacheKey = `${preset}-${passTd}-${pos}`
   const cached = posCache.get(cacheKey)
   if (cached && Date.now() - cached.at < STALE_MS) {
-    const pruned = cached.rows.filter(r => !exclude.has(r.player_id)).sort((a,b)=>b.ppg-a.ppg).slice(0, limit)
+    const pruned = cached.rows
+      .filter(r => !exclude.has(r.player_id))
+      .sort((a,b)=>b.ppg-a.ppg)
+      .slice(0, limit)
     return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
       headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
     })
   }
 
-  const rows = await getRowsForPos(pos, preset, passTd, seasons)
-  const pruned = rows.filter(r => !exclude.has(r.player_id)).sort((a,b)=>b.ppg-a.ppg).slice(0, limit)
+  if (fast) {
+    // Nothing cached and fast mode requested → return empty quickly
+    return new Response(JSON.stringify({ preset, passTd, players: [] }), {
+      headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
+    })
+  }
+
+  const all = await fetchPlayers()
+  const subset = all.filter(p => p.position === pos)
+  const rows = await buildProjectionsFor(subset, { preset, passTd })
+  posCache.set(cacheKey, { at: Date.now(), rows })
+
+  const pruned = rows
+    .filter(r => !exclude.has(r.player_id))
+    .sort((a,b)=>b.ppg-a.ppg)
+    .slice(0, limit)
+
   return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
     headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
   })
