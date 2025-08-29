@@ -742,73 +742,43 @@ function BestAvailable({
   draftedIds,
   preset,
   passTd,
+  games,                 // ← add games
 }: {
-  draftedIds: Set<string> // pass union (drafted ∪ rostered)
+  draftedIds: Set<string>   // union of drafted ∪ rostered ids
   preset: ScoringPreset
   passTd: 4 | 6
+  games: number
 }) {
-  // cache each position independently; never overwrite others
-  const [byPos, setByPos] = React.useState<Record<'QB'|'RB'|'WR'|'TE', ProjectionRow[]>>({
-    QB: [], RB: [], WR: [], TE: []
-  })
+  const [all, setAll] = React.useState<ProjectionRow[] | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
-  // recompute Top 15 from union of all positions whenever data or excludes change
-  const rows = React.useMemo(() => {
-    const merged = [...byPos.QB, ...byPos.RB, ...byPos.WR, ...byPos.TE]
-    const seen = new Set<string>()
-    const out: ProjectionRow[] = []
-    for (const r of merged) {
-      if (!r?.player_id) continue
-      if (draftedIds.has(r.player_id)) continue
-      if (seen.has(r.player_id)) continue
-      seen.add(r.player_id)
-      out.push(r)
-    }
-    out.sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
-    return out.slice(0, 15)
-  }, [byPos, draftedIds])
-
+  // Fetch ONCE for ALL positions; no server-side exclude.
   React.useEffect(() => {
     let ignore = false
     const abort = new AbortController()
-    const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
-
-    const fetchPos = async (pos: string, limit: number, fast: boolean) => {
-      const url =
-        `/api/projections?pos=${pos}&limit=${limit}&preset=${preset}&passTd=${passTd}` +
-        (fast ? `&fast=1` : ``)
-      const res = await fetch(url, { cache: 'no-store', signal: abort.signal })
-      if (!res.ok) throw new Error(String(res.status))
-      const j = (await res.json()) as { players: ProjectionRow[] }
-      return Array.isArray(j.players) ? j.players : []
-    }
 
     async function run() {
-      setLoading(true); setError(null)
-
+      setLoading(true); setError(null); setAll(null)
       try {
-        // FAST pass for all four positions (render partial union immediately)
-        await Promise.allSettled(
-          POS.map(async (p) => {
-            try {
-              const list = await fetchPos(p, 60, true)
-              if (ignore) return
-              setByPos(prev => ({ ...prev, [p]: list }))
-            } catch { /* ignore a position if fast miss */ }
-          })
-        )
+        // grab a big pool (fast first, then deep)
+        const fastUrl = `/api/projections?pos=ALL&limit=400&preset=${preset}&passTd=${passTd}&fast=1`
+        const deepUrl = `/api/projections?pos=ALL&limit=400&preset=${preset}&passTd=${passTd}`
 
-        // Slow warm-up: fetch deeper lists and update per-position as they finish
-        for (const p of POS) {
-          if (ignore) break
-          try {
-            const deep = await fetchPos(p, 300, false)
-            if (ignore) break
-            setByPos(prev => ({ ...prev, [p]: deep }))
-          } catch { /* keep whatever we had for that pos */ }
-        }
+        // quick pass for instant UI
+        try {
+          const f = await fetch(fastUrl, { cache: 'no-store', signal: abort.signal })
+          if (f.ok) {
+            const j = await f.json() as { players: ProjectionRow[] }
+            if (!ignore) setAll(Array.isArray(j.players) ? j.players : [])
+          }
+        } catch {}
+
+        // deep pass (replaces fast results as soon as it finishes)
+        const r = await fetch(deepUrl, { cache: 'no-store', signal: abort.signal })
+        if (!r.ok) throw new Error(`projections failed ${r.status}`)
+        const j = await r.json() as { players: ProjectionRow[] }
+        if (!ignore) setAll(Array.isArray(j.players) ? j.players : [])
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
@@ -818,8 +788,18 @@ function BestAvailable({
 
     run()
     return () => { ignore = true; abort.abort() }
-    // re-run only if scoring settings change
   }, [preset, passTd])
+
+  // Client-side exclude + season totals + top 15
+  const rows = React.useMemo(() => {
+    if (!all) return []
+    const seen = new Set<string>()
+    return all
+      .filter(r => r?.player_id && !draftedIds.has(r.player_id) && !seen.has(r.player_id) && seen.add(r.player_id))
+      .map(r => ({ ...r, seasonPts: (r.ppg || 0) * games }))
+      .sort((a, b) => (b.seasonPts || 0) - (a.seasonPts || 0))
+      .slice(0, 15)
+  }, [all, draftedIds, games])
 
   return (
     <Card className="bg-white/10 border-white/20 text-white">
@@ -827,14 +807,14 @@ function BestAvailable({
         <div className="text-lg font-semibold">Best Available (Top 15 Overall)</div>
 
         {loading && rows.length === 0 && <div className="text-sm opacity-75">Loading…</div>}
-        {error && rows.length === 0 && <div className="text-sm text-red-300">{String(error)}</div>}
+        {error && rows.length === 0 && <div className="text-sm text-red-300">{error}</div>}
         {!loading && !error && rows.length === 0 && (
           <div className="text-sm opacity-75">No eligible players found.</div>
         )}
 
         {rows.length > 0 && (
           <div className="space-y-2">
-            {rows.map((r) => (
+            {rows.map(r => (
               <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="text-sm font-semibold truncate">{r.full_name}</div>
@@ -844,7 +824,10 @@ function BestAvailable({
                 </div>
                 <div className="text-right">
                   <div className="text-base font-semibold">
-                    {r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span>
+                    {(r.seasonPts as number).toFixed(1)} <span className="text-xs opacity-75">pts</span>
+                  </div>
+                  <div className="text-[11px] opacity-70">
+                    ≈ {(r.ppg || 0).toFixed(2)} PPG × {games}
                   </div>
                 </div>
               </div>
@@ -1124,7 +1107,7 @@ export default function Page() {
           <DraftOrder draftedIds={draftedIds} onChange={handleDraftChange} />
 
           {/* Right: Best Available (Top 15 Overall, excludes drafted ∪ rostered) */}
-          <BestAvailable draftedIds={excludedIds} preset={preset} passTd={passTd} />
+          <BestAvailable draftedIds={excludedIds} preset={preset} passTd={passTd} games={games} />
         </div>
 
         {/* About card */}
