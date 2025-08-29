@@ -761,7 +761,7 @@ function BestAvailable({
         const res = await fetch(
           `/api/projections?pos=ALL&limit=15&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}&fast=1`,
           { cache: 'no-store' }
-        )
+        )        
         if (!res.ok) throw new Error(`projections failed ${res.status}`)
         const json = (await res.json()) as { players: ProjectionRow[] }
         if (!ignore) setRows(json.players || [])
