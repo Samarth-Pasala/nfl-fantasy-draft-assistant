@@ -751,7 +751,7 @@ function BestAvailable({
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
-  // Small helper: merge + dedupe + exclude + sort + slice
+  // Merge + dedupe + exclude + sort + slice
   const buildTop = React.useCallback(
     (lists: ProjectionRow[], limit = 15) => {
       const seen = new Set<string>()
@@ -769,7 +769,7 @@ function BestAvailable({
     [draftedIds]
   )
 
-  // Instantly drop drafted/rostered players from the list (optimistic UX)
+  // Instantly hide any player that just got drafted/rostered (no refetch)
   React.useEffect(() => {
     setRows(prev => prev.filter(r => !draftedIds.has(r.player_id)))
   }, [draftedIds])
@@ -778,57 +778,37 @@ function BestAvailable({
     let ignore = false
     const abort = new AbortController()
 
-    async function fetchPerPos(limitPerPos: number, fast = true) {
-      const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
-      const qs = (pos: string) =>
-        `/api/projections?pos=${pos}&limit=${limitPerPos}&preset=${preset}&passTd=${passTd}` +
-        (fast ? `&fast=1` : '')
+    const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
 
-      const settled = await Promise.allSettled(
-        POS.map(p => fetch(qs(p), { cache: 'no-store', signal: abort.signal }))
-      )
-
-      const payloads: ProjectionRow[] = []
-      for (const s of settled) {
-        if (s.status === 'fulfilled' && s.value.ok) {
-          try {
-            const j = (await s.value.json()) as { players: ProjectionRow[] }
-            if (Array.isArray(j.players)) payloads.push(...j.players)
-          } catch {}
-        }
-      }
-      return payloads
+    const fetchPos = async (pos: string, limit: number, fast: boolean) => {
+      const url =
+        `/api/projections?pos=${pos}&limit=${limit}&preset=${preset}&passTd=${passTd}` +
+        (fast ? `&fast=1` : ``)
+      const res = await fetch(url, { cache: 'no-store', signal: abort.signal })
+      if (!res.ok) throw new Error(String(res.status))
+      const j = (await res.json()) as { players: ProjectionRow[] }
+      return Array.isArray(j.players) ? j.players : []
     }
 
     async function run() {
       setLoading(true); setError(null)
 
       try {
-        // 1) FAST pass (cache-only) to avoid timeouts, show something immediately
-        const fastLists = await fetchPerPos(60, true)
-        if (!ignore) setRows(buildTop(fastLists, 15))
+        // 1) FAST pass for *all* positions (whatever is cached shows immediately)
+        const fastSettled = await Promise.allSettled(POS.map(p => fetchPos(p, 60, true)))
+        let merged: ProjectionRow[] = []
+        for (const s of fastSettled) if (s.status === 'fulfilled') merged = merged.concat(s.value)
+        if (!ignore) setRows(buildTop(merged, 15))
 
-        // 2) If we still have too few (cold cache), warm sequentially per position.
-        if (!ignore && fastLists.length < 15) {
-          const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
-          let merged: ProjectionRow[] = fastLists.slice()
-
-          for (const pos of POS) {
-            if (ignore) break
-            try {
-              const url = `/api/projections?pos=${pos}&limit=300&preset=${preset}&passTd=${passTd}`
-              const r = await fetch(url, { cache: 'no-store', signal: abort.signal })
-              if (r.ok) {
-                const j = (await r.json()) as { players: ProjectionRow[] }
-                if (Array.isArray(j.players)) {
-                  merged = merged.concat(j.players)
-                  // refresh UI incrementally as positions finish
-                  setRows(buildTop(merged, 15))
-                }
-              }
-            } catch {
-              // ignore single-pos errors; keep whatever we have
-            }
+        // 2) ALWAYS warm each position sequentially and update incrementally
+        for (const pos of POS) {
+          if (ignore) break
+          try {
+            const slow = await fetchPos(pos, 300, false)
+            merged = merged.concat(slow)
+            if (!ignore) setRows(buildTop(merged, 15))
+          } catch {
+            // ignore a single pos failure; continue warming others
           }
         }
       } catch (e: any) {
@@ -864,7 +844,9 @@ function BestAvailable({
                   </div>
                 </div>
                 <div className="text-right">
-                  <div className="text-base font-semibold">{r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span></div>
+                  <div className="text-base font-semibold">
+                    {r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span>
+                  </div>
                 </div>
               </div>
             ))}
