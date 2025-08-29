@@ -248,42 +248,53 @@ export async function GET(req: Request) {
     })
   }
 
-  // ---------- ALL → merge per-position (respect exclude) ----------
-  if (pos === 'ALL') {
-    let merged: ProjectionRow[] = []
+// ---------- ALL → merge per-position (respect exclude) ----------
+if (pos === 'ALL') {
+  let merged: ProjectionRow[] = []
 
+  for (const P of POSITIONS) {
+    const cacheKey = `${preset}-${passTd}-${P}`
+    const cached = posCache.get(cacheKey)
+
+    if (cached && Date.now() - cached.at < STALE_MS) {
+      merged = merged.concat(cached.rows)
+      continue
+    }
+
+    if (fast) {
+      // fast mode: skip building now; rely on cache if present
+      continue
+    }
+
+    // build & cache
+    const all = await fetchPlayers()
+    const subset = all.filter(p => p.position === P)
+    const rows = await buildProjectionsFor(subset, { preset, passTd })
+    posCache.set(cacheKey, { at: Date.now(), rows })
+    merged = merged.concat(rows)
+  }
+
+  // ❗️fallback: if fast=1 and nothing was cached, build once anyway
+  if (merged.length === 0) {
     for (const P of POSITIONS) {
       const cacheKey = `${preset}-${passTd}-${P}`
-      const cached = posCache.get(cacheKey)
-
-      if (cached && Date.now() - cached.at < STALE_MS) {
-        merged = merged.concat(cached.rows)
-        continue
-      }
-
-      if (fast) {
-        // Fast mode: skip building if not cached
-        continue
-      }
-
-      // Build and cache this position
       const all = await fetchPlayers()
       const subset = all.filter(p => p.position === P)
       const rows = await buildProjectionsFor(subset, { preset, passTd })
       posCache.set(cacheKey, { at: Date.now(), rows })
       merged = merged.concat(rows)
     }
-
-    // filter + sort + slice
-    const pruned = merged
-      .filter(r => r && !exclude.has(r.player_id))
-      .sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
-      .slice(0, limit)
-
-    return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
-      headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
-    })
   }
+
+  const pruned = merged
+    .filter(r => r && !exclude.has(r.player_id))
+    .sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
+    .slice(0, limit)
+
+  return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
+    headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
+  })
+}
 
   // ---------- per-position ----------
   if (!POSITIONS.includes(pos as PosKey)) {
