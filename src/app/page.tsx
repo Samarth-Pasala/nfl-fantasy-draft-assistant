@@ -22,7 +22,6 @@ import {
   CartesianGrid,
 } from 'recharts'
 
-
 /* ============================= Types & helpers ============================= */
 
 type PlayerLite = {
@@ -69,7 +68,6 @@ type SeasonSummary = {
   pass_att_pg: number
   rush_att_pg: number
 }
-
 
 type ScoringPreset = 'STANDARD' | 'HALF_PPR' | 'PPR'
 const PRESET_LABEL: Record<ScoringPreset, string> = {
@@ -130,8 +128,6 @@ function seasonsFromWeekly(
   }).sort((a, b) => a.season - b.season)
 }
 
-
-/** A game counts as "played" if any meaningful stat was logged (avoids DNPs). */
 function didPlay(w: WeeklyStat): boolean {
   return (
     (w.pts_ppr != null && w.pts_ppr !== 0) ||
@@ -208,20 +204,6 @@ function ppgFromLastN(
   return Number.isFinite(ppg) ? ppg : 0
 }
 
-
-/** Projection: simple average of last 50 *played* games, then age adjustment. */
-function projectPPG_Last50Avg(
-  weeks: WeeklyStat[],
-  preset: ScoringPreset,
-  passTd: 4 | 6,
-  pos?: string,
-  age?: number
-): number {
-  const pts = lastNPlayedPoints(weeks, 50, preset, passTd)
-  const base = pts.length ? pts.reduce((s, x) => s + x, 0) / pts.length : 0
-  return base * ageMultiplier(pos || '', age)
-}
-
 /* ================================ Hooks =================================== */
 
 function useDebounced<T>(val: T, ms = 300) {
@@ -241,7 +223,7 @@ function usePlayerBundle(
   const [player, setPlayer] = React.useState<PlayerLite | null>(null)
   const [ppg, setPpg] = React.useState<number>(0)
   const [summaries, setSummaries] = React.useState<SeasonSummary[]>([])
-  const [weeks, setWeeks] = React.useState<WeeklyStat[]>([])   // ← add this
+  const [weeks, setWeeks] = React.useState<WeeklyStat[]>([])
   const [loading, setLoading] = React.useState(false)
   const [err, setErr] = React.useState<string | null>(null)
 
@@ -253,7 +235,7 @@ function usePlayerBundle(
         setPlayer(null)
         setPpg(0)
         setSummaries([])
-        setWeeks([])                          // ← clear weeks when no id
+        setWeeks([])
         return
       }
 
@@ -281,7 +263,7 @@ function usePlayerBundle(
         if (sRes.ok) {
           const sJson = await sRes.json() as { weeks: WeeklyStat[] }
           if (!ignore) {
-            setWeeks(Array.isArray(sJson.weeks) ? sJson.weeks : [])         // ← keep raw weeks
+            setWeeks(Array.isArray(sJson.weeks) ? sJson.weeks : [])
             setSummaries(seasonsFromWeekly(sJson.weeks || [], preset, passTd))
           }
         } else {
@@ -298,7 +280,6 @@ function usePlayerBundle(
     return () => { ignore = true }
   }, [id, preset, passTd])
 
-  // ← include weeks in the return shape
   return { player, summaries, weeks, ppg, loading, err }
 }
 
@@ -455,8 +436,13 @@ function RosterSlot({
 }
 
 function RosterBuilder({
-  preset, passTd, games,
-}: { preset: ScoringPreset; passTd: 4 | 6; games: number }) {
+  preset, passTd, games, onRosterIdsChange,
+}: {
+  preset: ScoringPreset
+  passTd: 4 | 6
+  games: number
+  onRosterIdsChange: (ids: Set<string>) => void
+}) {
   const [slots, setSlots] = useState<Record<string, PlayerLite | null>>(
     () => Object.fromEntries(ALL_SLOTS.map(s => [s.key, null]))
   )
@@ -467,6 +453,10 @@ function RosterBuilder({
     for (const v of Object.values(slots)) if (v) s.add(v.player_id)
     return s
   }, [slots])
+
+  useEffect(() => {
+    onRosterIdsChange(takenIds)
+  }, [takenIds, onRosterIdsChange])
 
   const startersFilled = STARTER_SLOTS.reduce((n, s) => n + (slots[s.key] ? 1 : 0), 0)
   const benchFilled = BENCH_SLOTS.reduce((n, s) => n + (slots[s.key] ? 1 : 0), 0)
@@ -746,7 +736,6 @@ function DraftOrder({
   )
 }
 
-
 /* ============================== Best Available ============================ */
 
 function BestAvailable({
@@ -754,7 +743,7 @@ function BestAvailable({
   preset,
   passTd,
 }: {
-  draftedIds: Set<string>
+  draftedIds: Set<string> // pass union (drafted ∪ roster)
   preset: ScoringPreset
   passTd: 4 | 6
 }) {
@@ -820,107 +809,6 @@ function BestAvailable({
   )
 }
 
-function TopOverall({
-  draftedIds,
-  preset,
-  passTd,
-  limit = 15,
-}: {
-  draftedIds: Set<string>
-  preset: ScoringPreset
-  passTd: 4 | 6
-  limit?: number
-}) {
-  const [rows, setRows] = React.useState<ProjectionRow[] | null>(null)
-  const [loading, setLoading] = React.useState(true)
-  const [error, setError] = React.useState<string | null>(null)
-
-  React.useEffect(() => {
-    let ignore = false
-
-    async function run() {
-      setLoading(true); setError(null); setRows(null)
-      try {
-        // fetch a generous amount from EACH position, then merge
-        const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
-        const makeUrl = (pos: string) =>
-          `/api/projections?pos=${pos}&limit=${limit * 4}&preset=${preset}&passTd=${passTd}`
-
-        // continue even if one position fails (so others still show up)
-        const settled = await Promise.allSettled(
-          POS.map(p => fetch(makeUrl(p), { cache: 'no-store' }))
-        )
-
-        const okResponses = settled
-          .filter((s): s is PromiseFulfilledResult<Response> => s.status === 'fulfilled' && s.value.ok)
-          .map(s => s.value)
-
-        if (okResponses.length === 0) {
-          throw new Error('projections failed for all positions')
-        }
-
-        const payloads = await Promise.all(
-          okResponses.map(r => r.json() as Promise<{ players: ProjectionRow[] }>)
-        )
-
-        const merged: ProjectionRow[] = payloads.flatMap(p =>
-          Array.isArray(p.players) ? p.players : []
-        )
-
-        const seen = new Set<string>()
-        const dedup: ProjectionRow[] = []
-        for (const r of merged) {
-          if (!r?.player_id) continue
-          if (draftedIds.has(r.player_id)) continue
-          if (seen.has(r.player_id)) continue
-          seen.add(r.player_id)
-          dedup.push(r)
-        }
-
-        const top = dedup.sort((a, b) => (b.ppg || 0) - (a.ppg || 0)).slice(0, limit)
-        if (!ignore) setRows(top)
-      } catch (e: any) {
-        if (!ignore) setError(e?.message || 'Failed to load')
-      } finally {
-        if (!ignore) setLoading(false)
-      }
-    }
-
-    run()
-    return () => { ignore = true }
-  }, [draftedIds, preset, passTd, limit])
-
-  return (
-    <div className="space-y-3">
-      {loading && <div className="text-sm opacity-75">Loading best available…</div>}
-      {error && !loading && <div className="text-sm text-red-300">{error}</div>}
-      {!loading && !error && (!rows || rows.length === 0) && (
-        <div className="text-sm opacity-75">No eligible players found.</div>
-      )}
-
-      {!!rows && rows.length > 0 && (
-        <div className="space-y-2">
-          {rows.map((r) => (
-            <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold truncate">{r.full_name}</div>
-                <div className="text-xs opacity-80 truncate">
-                  {r.position}{r.team ? ` • ${r.team}` : ''}
-                </div>
-              </div>
-              <div className="text-right">
-                <div className="text-base font-semibold">
-                  {r.ppg.toFixed(2)} <span className="text-xs opacity-75">PPG</span>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
 /* ================================== Page ================================== */
 
 export default function Page() {
@@ -929,77 +817,75 @@ export default function Page() {
   const [passTd, setPassTd] = useState<4 | 6>(4)
   const [games, setGames] = useState(17)
 
-// players for compare
-const [left, setLeft] = useState<PlayerLite | null>(null)
-const [right, setRight] = useState<PlayerLite | null>(null)
+  // players for compare
+  const [left, setLeft] = useState<PlayerLite | null>(null)
+  const [right, setRight] = useState<PlayerLite | null>(null)
 
-const leftBundle = usePlayerBundle(left?.player_id, preset, passTd)
-const rightBundle = usePlayerBundle(right?.player_id, preset, passTd)
+  const leftBundle = usePlayerBundle(left?.player_id, preset, passTd)
+  const rightBundle = usePlayerBundle(right?.player_id, preset, passTd)
 
-// PPG from last 50 *played* games (age-adjusted)
-const leftPPG = useMemo(
-  () =>
-    ppgFromLastN(
-      leftBundle.weeks || [],
-      preset,
-      passTd,
-      leftBundle.player?.position,
-      leftBundle.player?.birth_date
-    ),
-  [leftBundle.weeks, preset, passTd, leftBundle.player?.position, leftBundle.player?.birth_date]
-)
+  // PPG from last 50 *played* games (age-adjusted)
+  const leftPPG = useMemo(
+    () =>
+      ppgFromLastN(
+        leftBundle.weeks || [],
+        preset,
+        passTd,
+        leftBundle.player?.position,
+        leftBundle.player?.birth_date
+      ),
+    [leftBundle.weeks, preset, passTd, leftBundle.player?.position, leftBundle.player?.birth_date]
+  )
 
-const rightPPG = useMemo(
-  () =>
-    ppgFromLastN(
-      rightBundle.weeks || [],
-      preset,
-      passTd,
-      rightBundle.player?.position,
-      rightBundle.player?.birth_date
-    ),
-  [rightBundle.weeks, preset, passTd, rightBundle.player?.position, rightBundle.player?.birth_date]
-)
+  const rightPPG = useMemo(
+    () =>
+      ppgFromLastN(
+        rightBundle.weeks || [],
+        preset,
+        passTd,
+        rightBundle.player?.position,
+        rightBundle.player?.birth_date
+      ),
+    [rightBundle.weeks, preset, passTd, rightBundle.player?.position, rightBundle.player?.birth_date]
+  )
 
-// season totals
-const leftProj = useMemo(() => leftPPG * games, [leftPPG, games])
-const rightProj = useMemo(() => rightPPG * games, [rightPPG, games])
+  // season totals
+  const leftProj = useMemo(() => leftPPG * games, [leftPPG, games])
+  const rightProj = useMemo(() => rightPPG * games, [rightPPG, games])
 
-const winner = useMemo(() => {
-  if (!left || !right) return null
-  if (Math.abs(leftProj - rightProj) < 1e-9) return 'Tie'
-  return leftProj > rightProj ? left.full_name : right.full_name
-}, [left, right, leftProj, rightProj])
+  const winner = useMemo(() => {
+    if (!left || !right) return null
+    if (Math.abs(leftProj - rightProj) < 1e-9) return 'Tie'
+    return leftProj > rightProj ? left.full_name : right.full_name
+  }, [left, right, leftProj, rightProj])
 
-
-// last 50 *played* games -> numbers only
-const chartData = useMemo(() => {
-  const a = lastNPlayedPoints(leftBundle.weeks || [], 50, preset, passTd);
-  const b = lastNPlayedPoints(rightBundle.weeks || [], 50, preset, passTd);
-
-  // reverse so older -> newer on the x-axis (optional)
-  const A = a.slice().reverse();
-  const B = b.slice().reverse();
-
-  const len = Math.max(A.length, B.length);
-  if (len === 0) return [];
-
-  const rows: Array<Record<string, number>> = [];
-  for (let i = 0; i < len; i++) {
-    const row: Record<string, number> = { game: i + 1 };
-    if (A[i] != null) row[left?.full_name || 'Player A'] = Number(A[i]);
-    if (B[i] != null) row[right?.full_name || 'Player B'] = Number(B[i]);
-    rows.push(row);
-  }
-  return rows;
-}, [left?.full_name, right?.full_name, leftBundle.weeks, rightBundle.weeks, preset, passTd]);
-
+  // last 50 *played* games -> numbers only
+  const chartData = useMemo(() => {
+    const a = lastNPlayedPoints(leftBundle.weeks || [], 50, preset, passTd)
+    const b = lastNPlayedPoints(rightBundle.weeks || [], 50, preset, passTd)
+    const A = a.slice().reverse()
+    const B = b.slice().reverse()
+    const len = Math.max(A.length, B.length)
+    if (len === 0) return []
+    const rows: Array<Record<string, number>> = []
+    for (let i = 0; i < len; i++) {
+      const row: Record<string, number> = { game: i + 1 }
+      if (A[i] != null) row[left?.full_name || 'Player A'] = Number(A[i])
+      if (B[i] != null) row[right?.full_name || 'Player B'] = Number(B[i])
+      rows.push(row)
+    }
+    return rows
+  }, [left?.full_name, right?.full_name, leftBundle.weeks, rightBundle.weeks, preset, passTd])
 
   // draftedIds from DraftOrder (lift state)
   const [draftedIds, setDraftedIds] = useState<Set<string>>(new Set())
   const handleDraftChange = useCallback((picks: DraftPick[]) => {
     setDraftedIds(new Set(picks.map(p => p.player.player_id)))
   }, [])
+
+  // rosterIds from RosterBuilder (union with drafted to exclude)
+  const [rosterIds, setRosterIds] = useState<Set<string>>(new Set())
+  const excludedIds = useMemo(() => new Set([...draftedIds, ...rosterIds]), [draftedIds, rosterIds])
 
   return (
     <TooltipProvider>
@@ -1040,7 +926,11 @@ const chartData = useMemo(() => {
               </div>
               <div>
                 <Label className="text-sm font-medium">Games</Label>
-                <Input type="number" min={10} max={17} className="mt-1"
+                <Input
+                  type="number"
+                  min={10}
+                  max={17}
+                  className="mt-1"
                   value={games}
                   onChange={e => setGames(clamp(Number(e.target.value), 10, 17))}
                 />
@@ -1138,24 +1028,12 @@ const chartData = useMemo(() => {
                 </Tooltip>
               </div>
 
-              {/* your line/bar chart stays here */}
               <div className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={chartData} margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
-                    {/* dashed background grid (remove this line if you don't want a grid) */}
                     <CartesianGrid strokeDasharray="3 6" stroke="#94a3b866" />
-
-                    <XAxis
-                      dataKey="game"
-                      tick={{ fontSize: 12, fill: '#E8EEF6' }}
-                      stroke="#E8EEF6"
-                    />
-                    <YAxis
-                      tick={{ fontSize: 12, fill: '#E8EEF6' }}
-                      stroke="#E8EEF6"
-                      domain={[0, 'auto']}
-                    />
-
+                    <XAxis dataKey="game" tick={{ fontSize: 12, fill: '#E8EEF6' }} stroke="#E8EEF6" />
+                    <YAxis tick={{ fontSize: 12, fill: '#E8EEF6' }} stroke="#E8EEF6" domain={[0, 'auto']} />
                     <Legend wrapperStyle={{ fontSize: 12, color: '#E8EEF6' }} />
                     <RTooltip
                       formatter={(v: unknown) =>
@@ -1163,23 +1041,20 @@ const chartData = useMemo(() => {
                       }
                       labelFormatter={(g) => `Game ${g}`}
                     />
-
-                    {/* Player A = teal/aquamarine */}
                     <Line
                       type="monotone"
                       dataKey={left?.full_name || 'Player A'}
-                      stroke="#10b981"     // teal
+                      stroke="#10b981"
                       strokeWidth={2.5}
                       dot={false}
                       activeDot={{ r: 4 }}
                       connectNulls
                       isAnimationActive={false}
                     />
-                    {/* Player B = red */}
                     <Line
                       type="monotone"
                       dataKey={right?.full_name || 'Player B'}
-                      stroke="#ef4444"     // red
+                      stroke="#ef4444"
                       strokeWidth={2.5}
                       dot={false}
                       activeDot={{ r: 4 }}
@@ -1196,17 +1071,17 @@ const chartData = useMemo(() => {
 
         {/* ======= ROW 5: 3-COLUMN SECTION ======= */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: Starters + Bench */}
-          <RosterBuilder preset={preset} passTd={passTd} games={games} />
+          {/* Left: Starters + Bench (reports rosterIds up to parent) */}
+          <RosterBuilder preset={preset} passTd={passTd} games={games} onRosterIdsChange={setRosterIds} />
 
-          {/* Middle: Draft Order */}
+          {/* Middle: Draft Order (reports draftedIds up to parent) */}
           <DraftOrder draftedIds={draftedIds} onChange={handleDraftChange} />
 
-          {/* Right: Best Available (auto-populates; excludes drafted) */}
-          <BestAvailable draftedIds={draftedIds} preset={preset} passTd={passTd} />
+          {/* Right: Best Available (Top 15 Overall, excludes drafted ∪ rostered) */}
+          <BestAvailable draftedIds={excludedIds} preset={preset} passTd={passTd} />
         </div>
 
-        {/* (Optional) About card — leave if you want; Best Available is NOT duplicated anymore */}
+        {/* About card */}
         <Card className="bg-white/10 border-white/20 text-white">
           <CardContent className="p-4 text-xs space-y-2">
             <div className="flex items-center gap-2 font-medium text-sm">
@@ -1214,7 +1089,7 @@ const chartData = useMemo(() => {
             </div>
             <p className="opacity-90">
               Transparent projection: average of last 50 played games (equal weight) with a small age adjustment by position.
-              “Best Available” auto-ranks per position and hides players already drafted in Draft Order.
+              “Best Available (Top 15 Overall)” updates live and hides players already on your roster or drafted in Draft Order.
             </p>
           </CardContent>
         </Card>
