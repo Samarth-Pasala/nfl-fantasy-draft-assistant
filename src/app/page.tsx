@@ -740,92 +740,71 @@ function DraftOrder({
   )
 }
 
-/* ============================== Best Available ============================ */
+/* ============================== Best Available (fixed) ============================== */
 
-type ProjectionPayload = { players: ProjectionRow[] }
-type RowWithSeason = ProjectionRow & { season_pts: number }
+type Row = {
+  player_id: string
+  full_name: string
+  position: 'QB' | 'RB' | 'WR' | 'TE' | string
+  team?: string
+  ppg: number
+}
 
 function BestAvailable({
   draftedIds,
   preset,
   passTd,
-  games = 17,          // pass games from parent if you want; default to 17
+  games = 17,
   limit = 15,
 }: {
-  draftedIds: Set<string>   // pass union (drafted ∪ rostered)
-  preset: 'STANDARD' | 'HALF_PPR' | 'PPR'
+  draftedIds: Set<string> // pass union (drafted ∪ roster)
+  preset: ScoringPreset
   passTd: 4 | 6
   games?: number
   limit?: number
 }) {
-  const [rows, setRows] = React.useState<RowWithSeason[] | null>(null)
+  const [posData, setPosData] = React.useState<Record<'QB'|'RB'|'WR'|'TE', Row[]>>({
+    QB: [], RB: [], WR: [], TE: []
+  })
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
+  // 1) Fetch ONCE per scoring setting (NOT on draftedIds changes)
   React.useEffect(() => {
     let ignore = false
+    const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
 
-    async function run() {
-      setLoading(true); setError(null); setRows(null)
+    async function load() {
+      setLoading(true); setError(null)
       try {
-        // OPTION 1 (recommended/fast): single ALL endpoint if your API supports it.
-        // Comment this block out if you strictly want the multi-fetch version.
-
-        const exclude = Array.from(draftedIds).join(',')
-        const allRes = await fetch(
-          `/api/projections?pos=ALL&limit=${limit * 2}&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}&fast=1`,
-          { cache: 'no-store' }
+        // Pull a generous slice from each position, cached by your API.
+        const perPosLimit = 200 // big enough to survive filtering
+        const urls = POS.map(
+          p => `/api/projections?pos=${p}&limit=${perPosLimit}&preset=${preset}&passTd=${passTd}`
         )
-        if (!allRes.ok) throw new Error(`projections failed ${allRes.status}`)
-        const allJson = (await allRes.json()) as ProjectionPayload
 
-        const seasonRanked = (Array.isArray(allJson.players) ? allJson.players : [])
-          .filter(r => r && r.player_id && !draftedIds.has(r.player_id))
-          .map(r => ({ ...r, season_pts: (r.ppg || 0) * games }))
-          .sort((a, b) => b.season_pts - a.season_pts)
-          .slice(0, limit)
+        const settled = await Promise.allSettled(urls.map(u => fetch(u, { cache: 'no-store' })))
+        const ok = settled
+          .filter((s): s is PromiseFulfilledResult<Response> => s.status === 'fulfilled' && s.value.ok)
+          .map(s => s.value)
 
-        if (!ignore) setRows(seasonRanked)
-        return
+        if (ok.length === 0) throw new Error('projections failed')
 
-        // ===== OPTION 2: multi-fetch (QB/RB/WR/TE) if you don't have ?pos=ALL =====
-        // const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
-        // const makeUrl = (pos: string) =>
-        //   `/api/projections?pos=${pos}&limit=${limit * 4}&preset=${preset}&passTd=${passTd}`
-        //
-        // const settled = await Promise.allSettled(
-        //   POS.map(p => fetch(makeUrl(p), { cache: 'no-store' }))
-        // )
-        // const ok: Response[] = settled
-        //   .filter((s): s is PromiseFulfilledResult<Response> => s.status === 'fulfilled' && s.value.ok)
-        //   .map(s => s.value)
-        //
-        // if (ok.length === 0) throw new Error('projections failed for all positions')
-        //
-        // // 👇 Correct typing here — no stray extra '>'
-        // const payloads: ProjectionPayload[] = await Promise.all(
-        //   ok.map(r => r.json() as Promise<ProjectionPayload>)
-        // )
-        //
-        // const excludeIds = draftedIds
-        // const seen = new Set<string>()
-        // const merged: RowWithSeason[] = []
-        //
-        // for (const p of payloads) {
-        //   const arr = Array.isArray(p.players) ? p.players : []
-        //   for (const r of arr) {
-        //     const id = r?.player_id
-        //     if (!id) continue
-        //     if (excludeIds.has(id)) continue
-        //     if (seen.has(id)) continue
-        //     seen.add(id)
-        //     merged.push({ ...r, season_pts: (r.ppg || 0) * games })
-        //   }
-        // }
-        //
-        // const top = merged.sort((a, b) => b.season_pts - a.season_pts).slice(0, limit)
-        // if (!ignore) setRows(top)
+        const payloads = await Promise.all(ok.map(r => r.json() as Promise<{ players: Row[] }>))
 
+        // Bucket back into record
+        const next: Record<'QB'|'RB'|'WR'|'TE', Row[]> = { QB: [], RB: [], WR: [], TE: [] }
+        for (const data of payloads) {
+          const arr = Array.isArray(data.players) ? data.players : []
+          for (const r of arr) {
+            const pos = String(r.position || '').toUpperCase()
+            if (pos === 'QB' || pos === 'RB' || pos === 'WR' || pos === 'TE') {
+              next[pos].push(r)
+            }
+          }
+        }
+
+        if (!ignore) setPosData(next)
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
@@ -833,22 +812,47 @@ function BestAvailable({
       }
     }
 
-    run()
+    load()
     return () => { ignore = true }
-  }, [draftedIds, preset, passTd, games, limit])
+  }, [preset, passTd])
+
+  // 2) Derive Top N overall LOCALLY whenever draftedIds/games change
+  const rows = React.useMemo(() => {
+    // merge, exclude, compute season points, then sort
+    const exclude = draftedIds
+    const merged: Array<Row & { season_pts: number }> = []
+    const seen = new Set<string>()
+
+    for (const list of Object.values(posData)) {
+      for (const r of list) {
+        const id = r?.player_id
+        if (!id) continue
+        if (exclude.has(id)) continue
+        if (seen.has(id)) continue
+        seen.add(id)
+        merged.push({ ...r, season_pts: (r.ppg || 0) * (games ?? 17) })
+      }
+    }
+
+    merged.sort((a, b) => b.season_pts - a.season_pts)
+    return merged.slice(0, limit)
+  }, [posData, draftedIds, games, limit])
 
   return (
     <Card className="bg-white/10 border-white/20 text-white">
       <CardContent className="p-4 space-y-6">
-        <div className="text-lg font-semibold">Best Available (Top 15 Overall)</div>
+        <div className="text-lg font-semibold">Best Available (Top {limit} Overall)</div>
+        <div className="text-xs opacity-70">
+          Ranks by projected season points (PPG × {games}). Updates instantly as you add players.
+        </div>
 
         {loading && <div className="text-sm opacity-75">Loading…</div>}
         {error && !loading && <div className="text-sm text-red-300">{error}</div>}
-        {!loading && !error && (!rows || rows.length === 0) && (
+        {!loading && !error && rows.length === 0 && (
           <div className="text-sm opacity-75">No eligible players found.</div>
         )}
 
-        {!!rows && rows.length > 0 && (
+        {!loading && !error && rows.length > 0 && (
           <div className="space-y-2">
             {rows.map((r) => (
               <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
@@ -860,7 +864,7 @@ function BestAvailable({
                 </div>
                 <div className="text-right">
                   <div className="text-base font-semibold">
-                    {r.season_pts.toFixed(1)} <span className="text-xs opacity-75">pts</span>
+                    {(r.ppg * games).toFixed(1)} <span className="text-xs opacity-75">pts</span>
                   </div>
                   <div className="text-xs opacity-70">≈ {r.ppg.toFixed(2)} PPG × {games}</div>
                 </div>
@@ -948,8 +952,8 @@ export default function Page() {
   }, [])
 
   // rosterIds from RosterBuilder (union with drafted to exclude)
-  const [rosterIds, setRosterIds] = useState<Set<string>>(new Set());
-  const excludedIds = useMemo(() => new Set([...draftedIds, ...rosterIds]), [draftedIds, rosterIds]);  
+  const [rosterIds, setRosterIds] = useState<Set<string>>(new Set())
+  const excludedIds = useMemo(() => new Set([...draftedIds, ...rosterIds]), [draftedIds, rosterIds])
 
   return (
     <TooltipProvider>
@@ -1142,12 +1146,7 @@ export default function Page() {
           <DraftOrder draftedIds={draftedIds} onChange={handleDraftChange} />
 
           {/* Right: Best Available (Top 15 Overall, excludes drafted ∪ rostered) */}
-          <BestAvailable
-            draftedIds={excludedIds}
-            preset={preset}
-            passTd={passTd}
-            games={games}
-          />
+          <BestAvailable draftedIds={excludedIds} preset={preset} passTd={passTd} games={games} />
         </div>
 
         {/* About card */}
