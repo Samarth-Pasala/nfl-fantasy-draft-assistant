@@ -59,6 +59,10 @@ type ProjectionRow = {
   ppg: number
 }
 
+type ProjectionRowWithSeason = ProjectionRow & {
+  season_pts: number; // ppg * games
+};
+
 type SeasonSummary = {
   season: number
   games: number
@@ -739,95 +743,117 @@ function DraftOrder({
 /* ============================== Best Available ============================ */
 
 function BestAvailable({
-  draftedIds,
+  draftedIds,            // pass the union (drafted ∪ roster) from the parent
   preset,
   passTd,
-  games,                 // ← add games
+  games,
 }: {
-  draftedIds: Set<string>   // union of drafted ∪ rostered ids
-  preset: ScoringPreset
-  passTd: 4 | 6
-  games: number
+  draftedIds: Set<string>;
+  preset: ScoringPreset;
+  passTd: 4 | 6;
+  games: number;
 }) {
-  const [all, setAll] = React.useState<ProjectionRow[] | null>(null)
-  const [loading, setLoading] = React.useState(true)
-  const [error, setError] = React.useState<string | null>(null)
+  const [rows, setRows] = React.useState<ProjectionRowWithSeason[] | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
 
-  // Fetch ONCE for ALL positions; no server-side exclude.
   React.useEffect(() => {
-    let ignore = false
-    const abort = new AbortController()
+    const ctrl = new AbortController();
 
     async function run() {
-      setLoading(true); setError(null); setAll(null)
+      setLoading(true);
+      setError(null);
+      setRows(null);
+
       try {
-        // grab a big pool (fast first, then deep)
-        const fastUrl = `/api/projections?pos=ALL&limit=400&preset=${preset}&passTd=${passTd}&fast=1`
-        const deepUrl = `/api/projections?pos=ALL&limit=400&preset=${preset}&passTd=${passTd}`
+        // build exclude list from drafted/rostered ids
+        const exclude = encodeURIComponent(Array.from(draftedIds).join(','));
 
-        // quick pass for instant UI
-        try {
-          const f = await fetch(fastUrl, { cache: 'no-store', signal: abort.signal })
-          if (f.ok) {
-            const j = await f.json() as { players: ProjectionRow[] }
-            if (!ignore) setAll(Array.isArray(j.players) ? j.players : [])
-          }
-        } catch {}
+        // fetch a generous slice from EACH position (fast, cached by your API)
+        const POS: Array<'QB' | 'RB' | 'WR' | 'TE'> = ['QB', 'RB', 'WR', 'TE'];
+        const perPosLimit = 80; // plenty; we'll sort/slice to top 15 later
+        const urls = POS.map(
+          (p) =>
+            `/api/projections?pos=${p}&limit=${perPosLimit}&preset=${preset}&passTd=${passTd}&exclude=${exclude}`
+        );
 
-        // deep pass (replaces fast results as soon as it finishes)
-        const r = await fetch(deepUrl, { cache: 'no-store', signal: abort.signal })
-        if (!r.ok) throw new Error(`projections failed ${r.status}`)
-        const j = await r.json() as { players: ProjectionRow[] }
-        if (!ignore) setAll(Array.isArray(j.players) ? j.players : [])
+        const settled = await Promise.allSettled(
+          urls.map((u) => fetch(u, { cache: 'no-store', signal: ctrl.signal }))
+        );
+
+        const ok = settled
+          .filter(
+            (s): s is PromiseFulfilledResult<Response> =>
+              s.status === 'fulfilled' && s.value.ok
+          )
+          .map((s) => s.value);
+
+        if (ok.length === 0) throw new Error('projections failed');
+
+        const payloads = await Promise.all(
+          ok.map((r) => r.json() as Promise<{ players: ProjectionRow[] }>)
+        );
+
+        // merge all positions, de-dupe, exclude (already excluded server-side, but belt & suspenders)
+        const merged = payloads.flatMap((p) => (Array.isArray(p.players) ? p.players : []));
+        const seen = new Set<string>();
+        const dedup = merged.filter((r) => {
+          if (!r?.player_id) return false;
+          if (draftedIds.has(r.player_id)) return false;
+          if (seen.has(r.player_id)) return false;
+          seen.add(r.player_id);
+          return true;
+        });
+
+        // convert to season totals and rank
+        const ranked: ProjectionRowWithSeason[] = dedup
+          .map((r) => ({ ...r, season_pts: (r.ppg || 0) * games }))
+          .sort((a, b) => b.season_pts - a.season_pts)
+          .slice(0, 15);
+
+        setRows(ranked);
       } catch (e: any) {
-        if (!ignore) setError(e?.message || 'Failed to load')
+        if (e?.name !== 'AbortError') setError(e?.message || 'Failed to load');
       } finally {
-        if (!ignore) setLoading(false)
+        setLoading(false);
       }
     }
 
-    run()
-    return () => { ignore = true; abort.abort() }
-  }, [preset, passTd])
-
-  // Client-side exclude + season totals + top 15
-  const rows = React.useMemo(() => {
-    if (!all) return []
-    const seen = new Set<string>()
-    return all
-      .filter(r => r?.player_id && !draftedIds.has(r.player_id) && !seen.has(r.player_id) && seen.add(r.player_id))
-      .map(r => ({ ...r, seasonPts: (r.ppg || 0) * games }))
-      .sort((a, b) => (b.seasonPts || 0) - (a.seasonPts || 0))
-      .slice(0, 15)
-  }, [all, draftedIds, games])
+    run();
+    return () => ctrl.abort();
+  }, [draftedIds, preset, passTd, games]);
 
   return (
     <Card className="bg-white/10 border-white/20 text-white">
       <CardContent className="p-4 space-y-6">
         <div className="text-lg font-semibold">Best Available (Top 15 Overall)</div>
 
-        {loading && rows.length === 0 && <div className="text-sm opacity-75">Loading…</div>}
-        {error && rows.length === 0 && <div className="text-sm text-red-300">{error}</div>}
-        {!loading && !error && rows.length === 0 && (
+        {loading && <div className="text-sm opacity-75">Loading…</div>}
+        {error && !loading && <div className="text-sm text-red-300">{error}</div>}
+        {!loading && !error && (!rows || rows.length === 0) && (
           <div className="text-sm opacity-75">No eligible players found.</div>
         )}
 
-        {rows.length > 0 && (
+        {!!rows && rows.length > 0 && (
           <div className="space-y-2">
-            {rows.map(r => (
-              <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
+            {rows.map((r) => (
+              <div
+                key={r.player_id}
+                className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3"
+              >
                 <div className="min-w-0">
                   <div className="text-sm font-semibold truncate">{r.full_name}</div>
                   <div className="text-xs opacity-80 truncate">
-                    {r.position}{r.team ? ` • ${r.team}` : ''}
+                    {r.position}
+                    {r.team ? ` • ${r.team}` : ''}
                   </div>
                 </div>
                 <div className="text-right">
                   <div className="text-base font-semibold">
-                    {(r.seasonPts as number).toFixed(1)} <span className="text-xs opacity-75">pts</span>
+                    {r.season_pts.toFixed(1)} <span className="text-xs opacity-75">pts</span>
                   </div>
-                  <div className="text-[11px] opacity-70">
-                    ≈ {(r.ppg || 0).toFixed(2)} PPG × {games}
+                  <div className="text-[11px] opacity-60">
+                    ≈ {r.ppg.toFixed(2)} PPG × {games}
                   </div>
                 </div>
               </div>
@@ -836,7 +862,7 @@ function BestAvailable({
         )}
       </CardContent>
     </Card>
-  )
+  );
 }
 /* ================================== Page ================================== */
 
@@ -913,8 +939,8 @@ export default function Page() {
   }, [])
 
   // rosterIds from RosterBuilder (union with drafted to exclude)
-  const [rosterIds, setRosterIds] = useState<Set<string>>(new Set())
-  const excludedIds = useMemo(() => new Set([...draftedIds, ...rosterIds]), [draftedIds, rosterIds])
+  const [rosterIds, setRosterIds] = useState<Set<string>>(new Set());
+  const excludedIds = useMemo(() => new Set([...draftedIds, ...rosterIds]), [draftedIds, rosterIds]);  
 
   return (
     <TooltipProvider>
