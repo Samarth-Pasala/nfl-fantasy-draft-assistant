@@ -38,7 +38,7 @@ type ProjectionRow = {
   ppg: number
 }
 
-// ---------------- helpers (same as your page) ----------------
+/* ---------------- helpers ---------------- */
 function weeklyPoints(stat: WeeklyStat, preset: ScoringPreset, passTd: 4 | 6) {
   if (preset === 'PPR' && stat.pts_ppr != null) return stat.pts_ppr
   if (preset === 'HALF_PPR' && stat.pts_half_ppr != null) return stat.pts_half_ppr
@@ -49,7 +49,6 @@ function weeklyPoints(stat: WeeklyStat, preset: ScoringPreset, passTd: 4 | 6) {
   const rec = (stat.rec_yd ?? 0) * 0.1 + (stat.rec_td ?? 0) * 6 + (stat.rec ?? 0) * catchBonus
   return pass + rush + rec
 }
-
 function yearsSince(dateISO?: string) {
   if (!dateISO) return undefined
   const d = new Date(dateISO)
@@ -57,7 +56,6 @@ function yearsSince(dateISO?: string) {
   const now = new Date()
   return (now.getTime() - d.getTime()) / (365.25 * 24 * 3600 * 1000)
 }
-
 function ageMultiplier(pos: string, age?: number) {
   if (!age) return 1
   let mult = 1
@@ -80,7 +78,6 @@ function ageMultiplier(pos: string, age?: number) {
   }
   return mult
 }
-
 function lastNPlayedPoints(
   weeks: WeeklyStat[],
   n: number,
@@ -98,13 +95,12 @@ function lastNPlayedPoints(
   }
   return pts
 }
-
 function average(arr: number[]) {
   if (!arr.length) return 0
   return arr.reduce((a, b) => a + b, 0) / arr.length
 }
 
-// ---------------- small fetchers ----------------
+/* ---------------- small fetchers ---------------- */
 async function fetchPlayers(): Promise<PlayerLite[]> {
   const r = await fetch('https://api.sleeper.app/v1/players/nfl', { cache: 'no-store' })
   const json = await r.json()
@@ -135,30 +131,20 @@ async function fetchWeek(season: number, week: number): Promise<any[]> {
   return []
 }
 
-// ---------------- in-memory cache ----------------
+/* ---------------- cache ---------------- */
 type PosKey = 'QB'|'RB'|'WR'|'TE'
 const POSITIONS: PosKey[] = ['QB','RB','WR','TE']
-
-const posCache = new Map<
-  string, // key: `${preset}-${passTd}-${pos}`
-  { at: number; rows: ProjectionRow[] }
->()
-const IDS_CACHE = new Map<
-  string, // key: `${preset}-${passTd}-${id}`
-  { at: number; row?: ProjectionRow }
->()
-
+const posCache = new Map<string, { at: number; rows: ProjectionRow[] }>() // `${preset}-${passTd}-${pos}`
+const IDS_CACHE = new Map<string, { at: number; row?: ProjectionRow }>()   // `${preset}-${passTd}-${id}`
 const STALE_MS = 12 * 60 * 60 * 1000 // 12 hours
 const SEASONS_DEFAULT = [2022, 2023, 2024]
 
-// Build projections for a subset of players (one position OR a few ids)
 async function buildProjectionsFor(
   players: PlayerLite[],
   opts: { preset: ScoringPreset; passTd: 4|6; seasons?: number[] }
 ): Promise<ProjectionRow[]> {
   const seasons = opts.seasons ?? SEASONS_DEFAULT
 
-  // 1) pull weekly stats and bucket by player
   const weeks: any[][] = []
   for (const season of seasons) {
     for (let wk = 1; wk <= 18; wk++) {
@@ -195,7 +181,6 @@ async function buildProjectionsFor(
     }
   }
 
-  // 2) compute ppg (last 50 played + age adj)
   const rows: ProjectionRow[] = []
   for (const p of players) {
     const arr = bucket.get(p.player_id) ?? []
@@ -211,10 +196,10 @@ async function buildProjectionsFor(
       ppg: Number.isFinite(adj) ? adj : 0,
     })
   }
-
   return rows
 }
 
+/* ---------------- route ---------------- */
 export async function GET(req: Request) {
   const url = new URL(req.url)
   const preset = (url.searchParams.get('preset') || 'PPR').toUpperCase() as ScoringPreset
@@ -222,10 +207,10 @@ export async function GET(req: Request) {
   const pos = (url.searchParams.get('pos') || '').toUpperCase()
   const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit') || 50)))
   const exclude = new Set((url.searchParams.get('exclude') || '').split(',').map(s => s.trim()).filter(Boolean))
-  const fast = url.searchParams.get('fast') === '1'
   const idsParam = url.searchParams.get('ids')
+  const fast = url.searchParams.get('fast') === '1'
 
-  // ---------- ids → specific players ----------
+  // ids → pull specific players fast
   if (idsParam) {
     const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean)
     const players = await fetchPlayers()
@@ -248,74 +233,64 @@ export async function GET(req: Request) {
     })
   }
 
-// ---------- ALL → merge per-position (respect exclude) ----------
-if (pos === 'ALL') {
-  let merged: ProjectionRow[] = []
+  // ---------- ALL → merge per-position, honor exclude, sort/slice ----------
+  if (pos === 'ALL') {
+    let merged: ProjectionRow[] = []
 
-  for (const P of POSITIONS) {
-    const cacheKey = `${preset}-${passTd}-${P}`
-    const cached = posCache.get(cacheKey)
-
-    if (cached && Date.now() - cached.at < STALE_MS) {
-      merged = merged.concat(cached.rows)
-      continue
-    }
-
-    if (fast) {
-      // fast mode: skip building now; rely on cache if present
-      continue
-    }
-
-    // build & cache
-    const all = await fetchPlayers()
-    const subset = all.filter(p => p.position === P)
-    const rows = await buildProjectionsFor(subset, { preset, passTd })
-    posCache.set(cacheKey, { at: Date.now(), rows })
-    merged = merged.concat(rows)
-  }
-
-  // ❗️fallback: if fast=1 and nothing was cached, build once anyway
-  if (merged.length === 0) {
     for (const P of POSITIONS) {
       const cacheKey = `${preset}-${passTd}-${P}`
+      const cached = posCache.get(cacheKey)
+
+      // use cache if fresh
+      if (cached && Date.now() - cached.at < STALE_MS) {
+        merged = merged.concat(cached.rows)
+        continue
+      }
+
+      // in fast mode, skip building now (we'll fallback below if nothing)
+      if (fast) continue
+
+      // else build & cache this position
       const all = await fetchPlayers()
       const subset = all.filter(p => p.position === P)
       const rows = await buildProjectionsFor(subset, { preset, passTd })
       posCache.set(cacheKey, { at: Date.now(), rows })
       merged = merged.concat(rows)
     }
-  }
 
-  const pruned = merged
-    .filter(r => r && !exclude.has(r.player_id))
-    .sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
-    .slice(0, limit)
+    // fallback: if fast=1 and nothing was cached, build once so UI isn't empty
+    if (merged.length === 0) {
+      const allPlayers = await fetchPlayers()
+      for (const P of POSITIONS) {
+        const cacheKey = `${preset}-${passTd}-${P}`
+        const subset = allPlayers.filter(p => p.position === P)
+        const rows = await buildProjectionsFor(subset, { preset, passTd })
+        posCache.set(cacheKey, { at: Date.now(), rows })
+        merged = merged.concat(rows)
+      }
+    }
 
-  return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
-    headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
-  })
-}
-
-  // ---------- per-position ----------
-  if (!POSITIONS.includes(pos as PosKey)) {
-    return new Response(JSON.stringify({ error: 'Provide ?pos=QB|RB|WR|TE or pos=ALL or ids=...' }), { status: 400 })
-  }
-
-  const cacheKey = `${preset}-${passTd}-${pos}`
-  const cached = posCache.get(cacheKey)
-  if (cached && Date.now() - cached.at < STALE_MS) {
-    const pruned = cached.rows
-      .filter(r => !exclude.has(r.player_id))
-      .sort((a,b)=>b.ppg-a.ppg)
+    const pruned = merged
+      .filter(r => r && !exclude.has(r.player_id))
+      .sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
       .slice(0, limit)
+
     return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
       headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
     })
   }
 
-  if (fast) {
-    // Nothing cached and fast mode requested → return empty quickly
-    return new Response(JSON.stringify({ preset, passTd, players: [] }), {
+  // ---------- per-position ----------
+  const POSITIONS_SET = new Set(POSITIONS)
+  if (!POSITIONS_SET.has(pos as PosKey)) {
+    return new Response(JSON.stringify({ error: 'Provide ?pos=QB|RB|WR|TE or ids=... or pos=ALL' }), { status: 400 })
+  }
+
+  const cacheKey = `${preset}-${passTd}-${pos}`
+  const cached = posCache.get(cacheKey)
+  if (cached && Date.now() - cached.at < STALE_MS) {
+    const pruned = cached.rows.filter(r => !exclude.has(r.player_id)).sort((a,b)=>b.ppg-a.ppg).slice(0, limit)
+    return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
       headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
     })
   }
@@ -325,11 +300,7 @@ if (pos === 'ALL') {
   const rows = await buildProjectionsFor(subset, { preset, passTd })
   posCache.set(cacheKey, { at: Date.now(), rows })
 
-  const pruned = rows
-    .filter(r => !exclude.has(r.player_id))
-    .sort((a,b)=>b.ppg-a.ppg)
-    .slice(0, limit)
-
+  const pruned = rows.filter(r => !exclude.has(r.player_id)).sort((a,b)=>b.ppg-a.ppg).slice(0, limit)
   return new Response(JSON.stringify({ preset, passTd, players: pruned }), {
     headers: { 'content-type': 'application/json', 'cache-control': 's-maxage=21600, stale-while-revalidate=86400' }
   })
