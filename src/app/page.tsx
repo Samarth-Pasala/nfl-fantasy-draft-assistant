@@ -747,37 +747,32 @@ function BestAvailable({
   preset: ScoringPreset
   passTd: 4 | 6
 }) {
-  const [rows, setRows] = React.useState<ProjectionRow[]>([])
+  // cache each position independently; never overwrite others
+  const [byPos, setByPos] = React.useState<Record<'QB'|'RB'|'WR'|'TE', ProjectionRow[]>>({
+    QB: [], RB: [], WR: [], TE: []
+  })
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
-  // Merge + dedupe + exclude + sort + slice
-  const buildTop = React.useCallback(
-    (lists: ProjectionRow[], limit = 15) => {
-      const seen = new Set<string>()
-      const out: ProjectionRow[] = []
-      for (const r of lists) {
-        if (!r?.player_id) continue
-        if (draftedIds.has(r.player_id)) continue
-        if (seen.has(r.player_id)) continue
-        seen.add(r.player_id)
-        out.push(r)
-      }
-      out.sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
-      return out.slice(0, limit)
-    },
-    [draftedIds]
-  )
-
-  // Instantly hide any player that just got drafted/rostered (no refetch)
-  React.useEffect(() => {
-    setRows(prev => prev.filter(r => !draftedIds.has(r.player_id)))
-  }, [draftedIds])
+  // recompute Top 15 from union of all positions whenever data or excludes change
+  const rows = React.useMemo(() => {
+    const merged = [...byPos.QB, ...byPos.RB, ...byPos.WR, ...byPos.TE]
+    const seen = new Set<string>()
+    const out: ProjectionRow[] = []
+    for (const r of merged) {
+      if (!r?.player_id) continue
+      if (draftedIds.has(r.player_id)) continue
+      if (seen.has(r.player_id)) continue
+      seen.add(r.player_id)
+      out.push(r)
+    }
+    out.sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
+    return out.slice(0, 15)
+  }, [byPos, draftedIds])
 
   React.useEffect(() => {
     let ignore = false
     const abort = new AbortController()
-
     const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
 
     const fetchPos = async (pos: string, limit: number, fast: boolean) => {
@@ -794,22 +789,25 @@ function BestAvailable({
       setLoading(true); setError(null)
 
       try {
-        // 1) FAST pass for *all* positions (whatever is cached shows immediately)
-        const fastSettled = await Promise.allSettled(POS.map(p => fetchPos(p, 60, true)))
-        let merged: ProjectionRow[] = []
-        for (const s of fastSettled) if (s.status === 'fulfilled') merged = merged.concat(s.value)
-        if (!ignore) setRows(buildTop(merged, 15))
+        // FAST pass for all four positions (render partial union immediately)
+        await Promise.allSettled(
+          POS.map(async (p) => {
+            try {
+              const list = await fetchPos(p, 60, true)
+              if (ignore) return
+              setByPos(prev => ({ ...prev, [p]: list }))
+            } catch { /* ignore a position if fast miss */ }
+          })
+        )
 
-        // 2) ALWAYS warm each position sequentially and update incrementally
-        for (const pos of POS) {
+        // Slow warm-up: fetch deeper lists and update per-position as they finish
+        for (const p of POS) {
           if (ignore) break
           try {
-            const slow = await fetchPos(pos, 300, false)
-            merged = merged.concat(slow)
-            if (!ignore) setRows(buildTop(merged, 15))
-          } catch {
-            // ignore a single pos failure; continue warming others
-          }
+            const deep = await fetchPos(p, 300, false)
+            if (ignore) break
+            setByPos(prev => ({ ...prev, [p]: deep }))
+          } catch { /* keep whatever we had for that pos */ }
         }
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
@@ -820,7 +818,8 @@ function BestAvailable({
 
     run()
     return () => { ignore = true; abort.abort() }
-  }, [preset, passTd, buildTop])
+    // re-run only if scoring settings change
+  }, [preset, passTd])
 
   return (
     <Card className="bg-white/10 border-white/20 text-white">
