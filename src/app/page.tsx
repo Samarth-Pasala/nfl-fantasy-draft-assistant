@@ -742,86 +742,100 @@ function DraftOrder({
 
 /* ============================== Best Available ============================ */
 
+type ProjectionPayload = { players: ProjectionRow[] }
+type RowWithSeason = ProjectionRow & { season_pts: number }
+
 function BestAvailable({
-  draftedIds,            // pass the union (drafted ∪ roster) from the parent
+  draftedIds,
   preset,
   passTd,
-  games,
+  games = 17,          // pass games from parent if you want; default to 17
+  limit = 15,
 }: {
-  draftedIds: Set<string>;
-  preset: ScoringPreset;
-  passTd: 4 | 6;
-  games: number;
+  draftedIds: Set<string>   // pass union (drafted ∪ rostered)
+  preset: 'STANDARD' | 'HALF_PPR' | 'PPR'
+  passTd: 4 | 6
+  games?: number
+  limit?: number
 }) {
-  const [rows, setRows] = React.useState<ProjectionRowWithSeason[] | null>(null);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const [rows, setRows] = React.useState<RowWithSeason[] | null>(null)
+  const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
-    const ctrl = new AbortController();
+    let ignore = false
 
     async function run() {
-      setLoading(true);
-      setError(null);
-      setRows(null);
-
+      setLoading(true); setError(null); setRows(null)
       try {
-        // build exclude list from drafted/rostered ids
-        const exclude = encodeURIComponent(Array.from(draftedIds).join(','));
+        // OPTION 1 (recommended/fast): single ALL endpoint if your API supports it.
+        // Comment this block out if you strictly want the multi-fetch version.
 
-        // fetch a generous slice from EACH position (fast, cached by your API)
-        const POS: Array<'QB' | 'RB' | 'WR' | 'TE'> = ['QB', 'RB', 'WR', 'TE'];
-        const perPosLimit = 80; // plenty; we'll sort/slice to top 15 later
-        const urls = POS.map(
-          (p) =>
-            `/api/projections?pos=${p}&limit=${perPosLimit}&preset=${preset}&passTd=${passTd}&exclude=${exclude}`
-        );
+        const exclude = Array.from(draftedIds).join(',')
+        const allRes = await fetch(
+          `/api/projections?pos=ALL&limit=${limit * 2}&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}&fast=1`,
+          { cache: 'no-store' }
+        )
+        if (!allRes.ok) throw new Error(`projections failed ${allRes.status}`)
+        const allJson = (await allRes.json()) as ProjectionPayload
 
-        const settled = await Promise.allSettled(
-          urls.map((u) => fetch(u, { cache: 'no-store', signal: ctrl.signal }))
-        );
-
-        const ok = settled
-          .filter(
-            (s): s is PromiseFulfilledResult<Response> =>
-              s.status === 'fulfilled' && s.value.ok
-          )
-          .map((s) => s.value);
-
-        if (ok.length === 0) throw new Error('projections failed');
-
-        const payloads = await Promise.all(
-          ok.map((r) => r.json() as Promise<{ players: ProjectionRow[] }>)
-        );
-
-        // merge all positions, de-dupe, exclude (already excluded server-side, but belt & suspenders)
-        const merged = payloads.flatMap((p) => (Array.isArray(p.players) ? p.players : []));
-        const seen = new Set<string>();
-        const dedup = merged.filter((r) => {
-          if (!r?.player_id) return false;
-          if (draftedIds.has(r.player_id)) return false;
-          if (seen.has(r.player_id)) return false;
-          seen.add(r.player_id);
-          return true;
-        });
-
-        // convert to season totals and rank
-        const ranked: ProjectionRowWithSeason[] = dedup
-          .map((r) => ({ ...r, season_pts: (r.ppg || 0) * games }))
+        const seasonRanked = (Array.isArray(allJson.players) ? allJson.players : [])
+          .filter(r => r && r.player_id && !draftedIds.has(r.player_id))
+          .map(r => ({ ...r, season_pts: (r.ppg || 0) * games }))
           .sort((a, b) => b.season_pts - a.season_pts)
-          .slice(0, 15);
+          .slice(0, limit)
 
-        setRows(ranked);
+        if (!ignore) setRows(seasonRanked)
+        return
+
+        // ===== OPTION 2: multi-fetch (QB/RB/WR/TE) if you don't have ?pos=ALL =====
+        // const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
+        // const makeUrl = (pos: string) =>
+        //   `/api/projections?pos=${pos}&limit=${limit * 4}&preset=${preset}&passTd=${passTd}`
+        //
+        // const settled = await Promise.allSettled(
+        //   POS.map(p => fetch(makeUrl(p), { cache: 'no-store' }))
+        // )
+        // const ok: Response[] = settled
+        //   .filter((s): s is PromiseFulfilledResult<Response> => s.status === 'fulfilled' && s.value.ok)
+        //   .map(s => s.value)
+        //
+        // if (ok.length === 0) throw new Error('projections failed for all positions')
+        //
+        // // 👇 Correct typing here — no stray extra '>'
+        // const payloads: ProjectionPayload[] = await Promise.all(
+        //   ok.map(r => r.json() as Promise<ProjectionPayload>)
+        // )
+        //
+        // const excludeIds = draftedIds
+        // const seen = new Set<string>()
+        // const merged: RowWithSeason[] = []
+        //
+        // for (const p of payloads) {
+        //   const arr = Array.isArray(p.players) ? p.players : []
+        //   for (const r of arr) {
+        //     const id = r?.player_id
+        //     if (!id) continue
+        //     if (excludeIds.has(id)) continue
+        //     if (seen.has(id)) continue
+        //     seen.add(id)
+        //     merged.push({ ...r, season_pts: (r.ppg || 0) * games })
+        //   }
+        // }
+        //
+        // const top = merged.sort((a, b) => b.season_pts - a.season_pts).slice(0, limit)
+        // if (!ignore) setRows(top)
+
       } catch (e: any) {
-        if (e?.name !== 'AbortError') setError(e?.message || 'Failed to load');
+        if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
-        setLoading(false);
+        if (!ignore) setLoading(false)
       }
     }
 
-    run();
-    return () => ctrl.abort();
-  }, [draftedIds, preset, passTd, games]);
+    run()
+    return () => { ignore = true }
+  }, [draftedIds, preset, passTd, games, limit])
 
   return (
     <Card className="bg-white/10 border-white/20 text-white">
@@ -837,24 +851,18 @@ function BestAvailable({
         {!!rows && rows.length > 0 && (
           <div className="space-y-2">
             {rows.map((r) => (
-              <div
-                key={r.player_id}
-                className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3"
-              >
+              <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="text-sm font-semibold truncate">{r.full_name}</div>
                   <div className="text-xs opacity-80 truncate">
-                    {r.position}
-                    {r.team ? ` • ${r.team}` : ''}
+                    {r.position}{r.team ? ` • ${r.team}` : ''}
                   </div>
                 </div>
                 <div className="text-right">
                   <div className="text-base font-semibold">
                     {r.season_pts.toFixed(1)} <span className="text-xs opacity-75">pts</span>
                   </div>
-                  <div className="text-[11px] opacity-60">
-                    ≈ {r.ppg.toFixed(2)} PPG × {games}
-                  </div>
+                  <div className="text-xs opacity-70">≈ {r.ppg.toFixed(2)} PPG × {games}</div>
                 </div>
               </div>
             ))}
@@ -862,8 +870,9 @@ function BestAvailable({
         )}
       </CardContent>
     </Card>
-  );
+  )
 }
+
 /* ================================== Page ================================== */
 
 export default function Page() {
@@ -1133,7 +1142,12 @@ export default function Page() {
           <DraftOrder draftedIds={draftedIds} onChange={handleDraftChange} />
 
           {/* Right: Best Available (Top 15 Overall, excludes drafted ∪ rostered) */}
-          <BestAvailable draftedIds={excludedIds} preset={preset} passTd={passTd} games={games} />
+          <BestAvailable
+            draftedIds={excludedIds}
+            preset={preset}
+            passTd={passTd}
+            games={games}
+          />
         </div>
 
         {/* About card */}
