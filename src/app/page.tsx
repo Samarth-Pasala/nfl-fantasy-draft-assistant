@@ -743,28 +743,94 @@ function BestAvailable({
   preset,
   passTd,
 }: {
-  draftedIds: Set<string> // pass union (drafted ∪ roster)
+  draftedIds: Set<string> // pass union (drafted ∪ rostered)
   preset: ScoringPreset
   passTd: 4 | 6
 }) {
-  const [rows, setRows] = React.useState<ProjectionRow[] | null>(null)
+  const [rows, setRows] = React.useState<ProjectionRow[]>([])
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
+  // Small helper: merge + dedupe + exclude + sort + slice
+  const buildTop = React.useCallback(
+    (lists: ProjectionRow[], limit = 15) => {
+      const seen = new Set<string>()
+      const out: ProjectionRow[] = []
+      for (const r of lists) {
+        if (!r?.player_id) continue
+        if (draftedIds.has(r.player_id)) continue
+        if (seen.has(r.player_id)) continue
+        seen.add(r.player_id)
+        out.push(r)
+      }
+      out.sort((a, b) => (b.ppg || 0) - (a.ppg || 0))
+      return out.slice(0, limit)
+    },
+    [draftedIds]
+  )
+
+  // Instantly drop drafted/rostered players from the list (optimistic UX)
+  React.useEffect(() => {
+    setRows(prev => prev.filter(r => !draftedIds.has(r.player_id)))
+  }, [draftedIds])
+
   React.useEffect(() => {
     let ignore = false
+    const abort = new AbortController()
+
+    async function fetchPerPos(limitPerPos: number, fast = true) {
+      const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
+      const qs = (pos: string) =>
+        `/api/projections?pos=${pos}&limit=${limitPerPos}&preset=${preset}&passTd=${passTd}` +
+        (fast ? `&fast=1` : '')
+
+      const settled = await Promise.allSettled(
+        POS.map(p => fetch(qs(p), { cache: 'no-store', signal: abort.signal }))
+      )
+
+      const payloads: ProjectionRow[] = []
+      for (const s of settled) {
+        if (s.status === 'fulfilled' && s.value.ok) {
+          try {
+            const j = (await s.value.json()) as { players: ProjectionRow[] }
+            if (Array.isArray(j.players)) payloads.push(...j.players)
+          } catch {}
+        }
+      }
+      return payloads
+    }
 
     async function run() {
-      setLoading(true); setError(null); setRows(null)
+      setLoading(true); setError(null)
+
       try {
-        const exclude = Array.from(draftedIds).join(',')
-        const res = await fetch(
-          `/api/projections?pos=ALL&limit=15&preset=${preset}&passTd=${passTd}&exclude=${encodeURIComponent(exclude)}`,
-          { cache: 'no-store' }
-        )  
-        if (!res.ok) throw new Error(`projections failed ${res.status}`)
-        const json = (await res.json()) as { players: ProjectionRow[] }
-        if (!ignore) setRows(json.players || [])
+        // 1) FAST pass (cache-only) to avoid timeouts, show something immediately
+        const fastLists = await fetchPerPos(60, true)
+        if (!ignore) setRows(buildTop(fastLists, 15))
+
+        // 2) If we still have too few (cold cache), warm sequentially per position.
+        if (!ignore && fastLists.length < 15) {
+          const POS: Array<'QB'|'RB'|'WR'|'TE'> = ['QB','RB','WR','TE']
+          let merged: ProjectionRow[] = fastLists.slice()
+
+          for (const pos of POS) {
+            if (ignore) break
+            try {
+              const url = `/api/projections?pos=${pos}&limit=300&preset=${preset}&passTd=${passTd}`
+              const r = await fetch(url, { cache: 'no-store', signal: abort.signal })
+              if (r.ok) {
+                const j = (await r.json()) as { players: ProjectionRow[] }
+                if (Array.isArray(j.players)) {
+                  merged = merged.concat(j.players)
+                  // refresh UI incrementally as positions finish
+                  setRows(buildTop(merged, 15))
+                }
+              }
+            } catch {
+              // ignore single-pos errors; keep whatever we have
+            }
+          }
+        }
       } catch (e: any) {
         if (!ignore) setError(e?.message || 'Failed to load')
       } finally {
@@ -773,21 +839,21 @@ function BestAvailable({
     }
 
     run()
-    return () => { ignore = true }
-  }, [draftedIds, preset, passTd])
+    return () => { ignore = true; abort.abort() }
+  }, [preset, passTd, buildTop])
 
   return (
     <Card className="bg-white/10 border-white/20 text-white">
       <CardContent className="p-4 space-y-6">
         <div className="text-lg font-semibold">Best Available (Top 15 Overall)</div>
 
-        {loading && <div className="text-sm opacity-75">Loading…</div>}
-        {error && !loading && <div className="text-sm text-red-300">{error}</div>}
-        {!loading && !error && (!rows || rows.length === 0) && (
+        {loading && rows.length === 0 && <div className="text-sm opacity-75">Loading…</div>}
+        {error && rows.length === 0 && <div className="text-sm text-red-300">{String(error)}</div>}
+        {!loading && !error && rows.length === 0 && (
           <div className="text-sm opacity-75">No eligible players found.</div>
         )}
 
-        {!!rows && rows.length > 0 && (
+        {rows.length > 0 && (
           <div className="space-y-2">
             {rows.map((r) => (
               <div key={r.player_id} className="rounded-lg border border-white/15 p-3 bg-white/5 flex items-center justify-between gap-3">
@@ -808,7 +874,6 @@ function BestAvailable({
     </Card>
   )
 }
-
 /* ================================== Page ================================== */
 
 export default function Page() {
